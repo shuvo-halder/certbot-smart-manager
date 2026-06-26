@@ -1,0 +1,72 @@
+[2026-06-27 02:00:01] INFO: Starting automatic certificate check...
+[2026-06-27 02:00:01] INFO: Detecting operating system...
+[2026-06-27 02:00:01] INFO: Detected OS: ubuntu 22.04 (Ubuntu 22.04.4 LTS)
+[2026-06-27 02:00:01] INFO: Detecting web server...
+[2026-06-27 02:00:01] INFO: Web server detected: nginx
+[2026-06-27 02:00:01] INFO: Detecting firewall...
+[2026-06-27 02:00:01] INFO: Firewall detected: UFW (active)
+[2026-06-27 02:00:01] INFO: Scanning certificates in /etc/letsencrypt/renewal/...
+[2026-06-27 02:00:01] INFO: Scanned 2 certificate(s)
+[2026-06-27 02:00:01] INFO: Creating backup of /etc/letsencrypt/ to /var/backups/certbot-smart-manager/20260627_020001/...
+[2026-06-27 02:00:03] SUCCESS: Backup created: /var/backups/certbot-smart-manager/20260627_020001/
+[2026-06-27 02:00:03] INFO: Starting renewal check for 2 certificate(s)...
+[2026-06-27 02:00:03] INFO: Certificate 'example.com': 25 days remaining (threshold: 30)
+[2026-06-27 02:00:03] INFO: Opening firewall ports for certificate validation...
+[2026-06-27 02:00:03] INFO: UFW: opening port 80/tcp
+[2026-06-27 02:00:04] INFO: UFW: opening port 443/tcp
+[2026-06-27 02:00:04] INFO: Renewing certificate: example.com
+[2026-06-27 02:00:06] SUCCESS: Renewed example.com
+[2026-06-27 02:00:06] INFO: Closing firewall ports...
+[2026-06-27 02:00:06] INFO: UFW: closing port 80/tcp
+[2026-06-27 02:00:07] INFO: UFW: closing port 443/tcp
+[2026-06-27 02:00:07] INFO: Certificate updated for example.com; reloading web server.
+[2026-06-27 02:00:07] INFO: Reloading nginx...
+[2026-06-27 02:00:07] SUCCESS: nginx reloaded successfully
+[2026-06-27 02:00:07] INFO: Certificate 'api.example.com': 45 days remaining (above threshold); skipping
+[2026-06-27 02:00:07] INFO: Renewal complete: 1 renewed, 0 failed, 1 skipped
+[2026-06-27 02:00:07] INFO: Auto-mode completed successfully
+---
+[2026-06-28 03:00:01] INFO: Starting automatic certificate check...
+[2026-06-28 03:00:01] INFO: OS: ubuntu 22.04
+[2026-06-28 03:00:01] INFO: Web server: nginx
+[2026-06-28 03:00:01] INFO: Firewall: UFW (active)
+[2026-06-28 03:00:01] INFO: Scanning certificates...
+[2026-06-28 03:00:01] INFO: Scanned 2 certificate(s)
+[2026-06-28 03:00:01] INFO: Backup: /var/backups/certbot-smart-manager/20260628_030001/
+[2026-06-28 03:00:02] SUCCESS: Backup created
+[2026-06-28 03:00:02] INFO: Certificate 'example.com': 24 days remaining (threshold: 30)
+[2026-06-28 03:00:02] INFO: Renewing certificate: example.com
+[2026-06-28 03:00:05] WARNING: No certificate change detected for example.com; reload skipped.
+[2026-06-28 03:00:05] INFO: Certificate 'api.example.com': 44 days remaining (above threshold); skipping
+[2026-06-28 03:00:05] INFO: Renewal complete: 1 renewed, 0 failed, 1 skipped
+[2026-06-28 03:00:05] INFO: Auto-mode completed successfully
+---
+[2026-07-10 03:00:01] INFO: Starting automatic certificate check...
+[2026-07-10 03:00:01] INFO: Scanning certificates...
+[2026-07-10 03:00:01] INFO: Scanned 2 certificate(s)
+[2026-07-10 03:00:01] SUCCESS: Backup created
+[2026-07-10 03:00:01] INFO: Certificate 'example.com': 12 days remaining (threshold: 30)
+[2026-07-10 03:00:01] INFO: Renewing certificate: example.com
+[2026-07-10 03:00:04] ERROR: Renewal failed for example.com (exit code: 1)
+[2026-07-10 03:00:04] ERROR: ALERT: SSL Certificate Renewal FAILED
+Domain:        example.com
+Expires:       2026-07-22
+Remaining:     12 days
+Status:        Automatic renewal FAILED
+---
+[2026-07-10 03:00:04] WARNING: Auto-mode completed with failures (check notifications)
+---
+[2026-07-11 03:00:01] INFO: Starting automatic certificate check...
+[2026-07-11 03:00:01] INFO: Certificate 'example.com': 11 days remaining (CRITICAL)
+[2026-07-11 03:00:01] WARNING: WARNING: SSL Certificate Expiring Soon
+Domain:        example.com
+Expires:       2026-07-22
+Remaining:     11 days
+Status:        Automatic renewal required
+Reason:        Certificate expiring in 11 days
+Action Required: Please manually inspect DNS/web server configuration.
+---
+[2026-07-11 03:00:01] WARNING: Certificate 'example.com': 11 days remaining (threshold: 30)
+[2026-07-11 03:00:01] INFO: Renewing certificate: example.com
+[2026-07-11 03:00:04] ERROR: Renewal failed for example.com (exit code: 1)
+[2026-07-11 03:00:04] WARNING: Auto-mode completed with failures (check notifications)

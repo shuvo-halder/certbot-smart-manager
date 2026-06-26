@@ -1,0 +1,21 @@
+[Unit]
+Description=Certbot Smart Manager - Twice Daily SSL Renewal Timer
+Documentation=https://github.com/shuvo-halder/certbot-smart-manager
+Requires=certbot-smart.service
+
+[Timer]
+# Run at 03:00 and 15:00 daily
+OnCalendar=*-*-* 03:00:00
+OnCalendar=*-*-* 15:00:00
+
+# Handle missed runs (e.g., system was off)
+Persistent=true
+
+# Random delay up to 5 minutes to avoid thundering herd
+RandomizedDelaySec=300
+
+# Accuracy
+AccuracySec=1min
+
+[Install]
+WantedBy=timers.target

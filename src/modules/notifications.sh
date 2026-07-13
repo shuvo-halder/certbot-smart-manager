@@ -88,7 +88,8 @@ notify_log() {
     esac
 
     # Also append a separator line for readability
-    printf -- '---\n' >> "$LOG_FILE"
+    local log_file="${LOG_FILE:-/var/log/certbot-smart-manager.log}"
+    printf -- '---\n' >> "$log_file"
 }
 
 # =============================================================================

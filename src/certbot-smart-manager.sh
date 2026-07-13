@@ -37,6 +37,26 @@ if [[ -f "$CONFIG_FILE" ]]; then
 fi
 
 # =============================================================================
+# GLOBAL DEFAULTS (applied after config load, before module loading)
+# =============================================================================
+# These defaults ensure all referenced variables are defined before modules
+# are sourced, preventing "unbound variable" errors under set -u.
+LOG_FILE="${LOG_FILE:-/var/log/certbot-smart-manager.log}"
+LOCK_FILE="${LOCK_FILE:-/var/lock/certbot-smart-manager.lock}"
+BACKUP_DIR="${BACKUP_DIR:-/var/backups/certbot-smart-manager}"
+BACKUP_ENABLED="${BACKUP_ENABLED:-true}"
+BACKUP_RETENTION_DAYS="${BACKUP_RETENTION_DAYS:-30}"
+THRESHOLD_DAYS="${THRESHOLD_DAYS:-30}"
+CRITICAL_THRESHOLD_DAYS="${CRITICAL_THRESHOLD_DAYS:-7}"
+LOG_LEVEL="${LOG_LEVEL:-INFO}"
+NOTIFICATION_METHOD="${NOTIFICATION_METHOD:-console}"
+
+# Export globally so sourced modules can rely on them
+export LOG_FILE LOCK_FILE BACKUP_DIR BACKUP_ENABLED
+export BACKUP_RETENTION_DAYS THRESHOLD_DAYS CRITICAL_THRESHOLD_DAYS
+export LOG_LEVEL NOTIFICATION_METHOD
+
+# =============================================================================
 # LOAD MODULES
 # =============================================================================
 # Each module sets its own set -Eeuo pipefail, so loading order is safe

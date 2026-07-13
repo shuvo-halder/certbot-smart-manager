@@ -360,6 +360,7 @@ install_scripts() {
     # Install main script
     if [[ -f "$MAIN_SCRIPT_SRC" ]]; then
         install -m 755 "$MAIN_SCRIPT_SRC" "${LIB_DEST}/${PROJECT_NAME}.sh"
+        chmod +x "${LIB_DEST}/${PROJECT_NAME}.sh"
         _log_operation "file:${LIB_DEST}/${PROJECT_NAME}.sh"
         echo_success "Main script installed."
     else
@@ -383,11 +384,31 @@ install_scripts() {
         echo_warning "Module directory not found: ${MODULES_SRC}"
     fi
 
+    # Ensure target script is definitely executable
+    chmod +x "${LIB_DEST}/${PROJECT_NAME}.sh" 2>/dev/null || true
+
     # Create symlink at /usr/local/bin/ssl-manager
     ln -sf "${LIB_DEST}/${PROJECT_NAME}.sh" "${BIN_DEST}/${SCRIPT_NAME}"
     _log_operation "symlink:${BIN_DEST}/${SCRIPT_NAME}"
-    chmod 755 "${BIN_DEST}/${SCRIPT_NAME}"
     echo_success "Symlink created: ${BIN_DEST}/${SCRIPT_NAME}"
+
+    # Validate symlink and target permissions
+    if [[ -L "${BIN_DEST}/${SCRIPT_NAME}" ]] || [[ -f "${BIN_DEST}/${SCRIPT_NAME}" ]]; then
+        if [[ ! -x "${LIB_DEST}/${PROJECT_NAME}.sh" ]]; then
+            echo_warning "Target script is not executable — attempting to fix."
+            chmod +x "${LIB_DEST}/${PROJECT_NAME}.sh" 2>/dev/null || true
+        fi
+    else
+        echo_warning "Symlink validation failed for ${BIN_DEST}/${SCRIPT_NAME}."
+    fi
+
+    # Warn if /usr/local/bin is not in PATH for the current user (non-root context)
+    if [[ ":$PATH:" != *":${BIN_DEST}:"* ]]; then
+        echo_warning "${BIN_DEST} is not in your PATH."
+        echo_warning "Add it to your PATH or use the full path: ${BIN_DEST}/${SCRIPT_NAME}"
+        echo_warning "For Bash, run: export PATH=\"\$PATH:${BIN_DEST}\""
+        echo_warning "To make permanent, add the above line to ~/.bashrc or ~/.profile."
+    fi
 
     _mark_step_done "scripts"
 }

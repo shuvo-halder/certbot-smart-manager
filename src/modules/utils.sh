@@ -19,12 +19,13 @@ IFS=$'\n\t'
 
 # Ensure log directory exists
 _mklogdir() {
+    local log_file="${LOG_FILE:-/var/log/certbot-smart-manager.log}"
     local log_dir
-    log_dir="$(dirname "$LOG_FILE")"
+    log_dir="$(dirname "$log_file")"
     if [[ ! -d "$log_dir" ]]; then
         mkdir -p "$log_dir" 2>/dev/null || true
     fi
-    touch "$LOG_FILE" 2>/dev/null || true
+    touch "$log_file" 2>/dev/null || true
 }
 
 _mklogdir
@@ -36,9 +37,10 @@ _log() {
     local timestamp
     timestamp="$(date '+%Y-%m-%d %H:%M:%S')"
     local message="$*"
+    local log_file="${LOG_FILE:-/var/log/certbot-smart-manager.log}"
 
     # Always write to log file
-    printf '[%s] %s: %s\n' "$timestamp" "$level" "$message" >> "$LOG_FILE"
+    printf '[%s] %s: %s\n' "$timestamp" "$level" "$message" >> "$log_file"
 
     # Also output to stderr for errors, stdout for others
     if [[ "$level" == "ERROR" ]]; then

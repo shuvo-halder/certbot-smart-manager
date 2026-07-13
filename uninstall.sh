@@ -54,7 +54,7 @@ echo_bold()    { printf '\033[1m%s\033[0m\n' "$*"; }
 
 # A separator line for visual clarity
 separator() {
-    printf '----------------------------------------\n'
+    printf '%s\n' '----------------------------------------'
 }
 
 # Utility: prompt yes/no (default: no)

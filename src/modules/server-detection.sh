@@ -26,6 +26,12 @@ WEB_SERVICES=()       # Array of detected web services
 WEB_SERVICE_TYPE=""   # "nginx", "apache", or "mixed"
 FIREWALL_TYPE="none"  # "none", "ufw", "firewalld"
 
+# Ports that THIS tool opened (and therefore may close again).
+# Entries: "ufw:<port>/<proto>" or "firewalld:<zone>:<port>/<proto>".
+# Pre-existing firewall rules are never recorded here, so they are never
+# removed — closing them would take a production site offline.
+OPENED_FIREWALL_PORTS=()
+
 # =============================================================================
 # OS DETECTION
 # =============================================================================
@@ -34,11 +40,11 @@ detect_os() {
     log_info "Detecting operating system..."
 
     if [[ -r /etc/os-release ]]; then
-        # shellcheck disable=SC1091
-        source /etc/os-release
-        OS_ID="${ID:-unknown}"
-        OS_VERSION="${VERSION_ID:-unknown}"
-        OS_NAME="${NAME:-unknown}"
+        # Read fields in a subshell — sourcing os-release here would clobber
+        # the script's own VERSION / NAME globals.
+        OS_ID="$(os_release_field ID)"
+        OS_VERSION="$(os_release_field VERSION_ID)"
+        OS_NAME="$(os_release_field NAME)"
     elif [[ -r /etc/redhat-release ]]; then
         OS_NAME="$(cat /etc/redhat-release)"
         if grep -qi "centos" /etc/redhat-release 2>/dev/null; then
@@ -67,7 +73,7 @@ detect_os() {
         ubuntu|debian)
             PKG_MANAGER="apt"
             ;;
-        centos|rhel|rocky|almalinux)
+        centos|rhel|rocky|almalinux|ol)
             if command_exists dnf; then
                 PKG_MANAGER="dnf"
             else
@@ -127,7 +133,7 @@ detect_web_server() {
         log_info "Web server detected: ${WEB_SERVICE_TYPE}"
     else
         WEB_SERVICE_TYPE="mixed"
-        log_info "Multiple web servers detected: ${WEB_SERVICES[*]}"
+        log_info "Multiple web servers detected: $(IFS=' '; printf '%s' "${WEB_SERVICES[*]}")"
     fi
 }
 
@@ -173,27 +179,36 @@ ufw_open_port() {
         return 0
     fi
 
-    # Check if port is already allowed
-    if ufw status 2>/dev/null | grep -Eq "^[[:space:]]*${port}[[:space:]]+ALLOW|${port}/.*ALLOW"; then
+    # Check if port is already allowed (by port number or an app profile
+    # such as "Nginx Full" / "Apache Full")
+    local status_out
+    status_out="$(ufw status 2>/dev/null || true)"
+    if printf '%s\n' "$status_out" | grep -Eq "^[[:space:]]*${port}(/${proto})?[[:space:]]+ALLOW"; then
         log_debug "UFW: port ${port}/${proto} already allowed"
+        return 0
+    fi
+    if printf '%s\n' "$status_out" | grep -Eqi '^[[:space:]]*(Nginx Full|Apache Full)[[:space:]]+ALLOW' \
+        || { [[ "$port" == "80" ]] && printf '%s\n' "$status_out" | grep -Eqi '^[[:space:]]*(Nginx HTTP|Apache)[[:space:]]+ALLOW'; } \
+        || { [[ "$port" == "443" ]] && printf '%s\n' "$status_out" | grep -Eqi '^[[:space:]]*(Nginx HTTPS|Apache Secure)[[:space:]]+ALLOW'; }; then
+        log_debug "UFW: port ${port}/${proto} already allowed via application profile"
         return 0
     fi
 
     log_info "UFW: opening port ${port}/${proto}"
-    ufw allow "${port}/${proto}" 2>/dev/null || true
+    if ufw allow "${port}/${proto}" >/dev/null 2>&1; then
+        OPENED_FIREWALL_PORTS+=("ufw:${port}/${proto}")
+    else
+        log_warning "UFW: failed to open port ${port}/${proto}"
+    fi
 }
 
-# UFW: Close a port
+# UFW: Close a port — only if this tool opened it
 ufw_close_port() {
     local port="$1"
     local proto="${2:-tcp}"
 
-    if [[ "$FIREWALL_TYPE" != "ufw" ]]; then
-        return 0
-    fi
-
     log_info "UFW: closing port ${port}/${proto}"
-    ufw delete allow "${port}/${proto}" 2>/dev/null || true
+    ufw delete allow "${port}/${proto}" >/dev/null 2>&1 || true
 }
 
 # firewalld: Get active zones
@@ -219,26 +234,31 @@ firewalld_open_port() {
             continue
         fi
 
+        local service=""
+        [[ "$port" == "80" ]] && service="http"
+        [[ "$port" == "443" ]] && service="https"
+        if [[ -n "$service" ]] && firewall-cmd --zone="$zone" --query-service="$service" >/dev/null 2>&1; then
+            log_debug "firewalld: service ${service} already enabled in zone ${zone}"
+            continue
+        fi
+
+        # Runtime-only change (no --permanent): it is reverted on reload anyway
         log_info "firewalld: opening port ${port}/${proto} in zone ${zone}"
-        firewall-cmd --zone="$zone" --add-port="${port}/${proto}" >/dev/null 2>&1 || true
+        if firewall-cmd --zone="$zone" --add-port="${port}/${proto}" >/dev/null 2>&1; then
+            OPENED_FIREWALL_PORTS+=("firewalld:${zone}:${port}/${proto}")
+        else
+            log_warning "firewalld: failed to open port ${port}/${proto} in zone ${zone}"
+        fi
     done < <(firewalld_get_zones)
 }
 
-# firewalld: Close a port
+# firewalld: Close a port in a zone — only called for ports this tool opened
 firewalld_close_port() {
-    local port="$1"
-    local proto="${2:-tcp}"
-    local zone
+    local zone="$1"
+    local port_proto="$2"
 
-    if [[ "$FIREWALL_TYPE" != "firewalld" ]]; then
-        return 0
-    fi
-
-    while IFS= read -r zone; do
-        [[ -z "$zone" ]] && continue
-        log_info "firewalld: closing port ${port}/${proto} in zone ${zone}"
-        firewall-cmd --zone="$zone" --remove-port="${port}/${proto}" >/dev/null 2>&1 || true
-    done < <(firewalld_get_zones)
+    log_info "firewalld: closing port ${port_proto} in zone ${zone}"
+    firewall-cmd --zone="$zone" --remove-port="${port_proto}" >/dev/null 2>&1 || true
 }
 
 # =============================================================================
@@ -263,22 +283,29 @@ open_firewall_ports() {
     esac
 }
 
-# Close ports opened for validation
+# Close ONLY the ports this tool opened for validation.
+# Safe to call multiple times (e.g. explicitly and again from the EXIT trap).
 close_firewall_ports() {
-    log_info "Closing firewall ports..."
-    case "$FIREWALL_TYPE" in
-        ufw)
-            ufw_close_port "80" "tcp"
-            ufw_close_port "443" "tcp"
-            ;;
-        firewalld)
-            firewalld_close_port "80" "tcp"
-            firewalld_close_port "443" "tcp"
-            ;;
-        none)
-            log_debug "No firewall to configure"
-            ;;
-    esac
+    if [[ ${#OPENED_FIREWALL_PORTS[@]} -eq 0 ]]; then
+        log_debug "No temporarily opened firewall ports to close"
+        return 0
+    fi
+
+    log_info "Closing temporarily opened firewall ports..."
+    local entry rest
+    for entry in "${OPENED_FIREWALL_PORTS[@]}"; do
+        case "$entry" in
+            ufw:*)
+                rest="${entry#ufw:}"
+                ufw_close_port "${rest%/*}" "${rest#*/}"
+                ;;
+            firewalld:*)
+                rest="${entry#firewalld:}"
+                firewalld_close_port "${rest%%:*}" "${rest#*:}"
+                ;;
+        esac
+    done
+    OPENED_FIREWALL_PORTS=()
 }
 
 # =============================================================================
@@ -297,11 +324,11 @@ reload_web_server() {
     for service in "${WEB_SERVICES[@]}"; do
         if systemctl is-active --quiet "$service" 2>/dev/null; then
             log_info "Reloading ${service}..."
-            systemctl reload "$service" 2>/dev/null && {
+            if systemctl reload "$service" 2>/dev/null; then
                 log_success "${service} reloaded successfully"
-            } || {
+            else
                 log_error "Failed to reload ${service}"
-            }
+            fi
         else
             log_warning "${service} is not active; skipping reload"
         fi

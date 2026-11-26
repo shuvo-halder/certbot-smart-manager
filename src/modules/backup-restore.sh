@@ -46,33 +46,48 @@ backup_letsencrypt() {
             return 1
         }
         chmod 750 "$backup_dir"
-        chown root:root "$backup_dir"
+        chown root:root "$backup_dir" 2>/dev/null || true
+    fi
+
+    if [[ -e "$backup_path" ]]; then
+        log_error "Backup target already exists: ${backup_path}"
+        return 1
     fi
 
     log_info "Creating backup of ${letsencrypt_dir} to ${backup_path}..."
 
-    # Use cp -a for a complete copy (preserves permissions, symlinks, timestamps)
-    cp -a "$letsencrypt_dir" "$backup_path" 2>/dev/null || {
-        log_error "Backup failed: unable to copy ${letsencrypt_dir}"
+    # Layout: <backup_dir>/<timestamp>/letsencrypt/...  (mirrors /etc/letsencrypt)
+    # Directory is 700 because it contains private keys.
+    mkdir -m 700 "$backup_path" 2>/dev/null || {
+        log_error "Backup failed: unable to create ${backup_path}"
         return 1
     }
 
-    # Also create a compressed archive for portability
-    backup_file="${backup_dir}/letsencrypt-${timestamp}.tar.gz"
-    tar -czf "$backup_file" -C /etc letsencrypt 2>/dev/null || {
-        log_warning "Failed to create compressed backup archive"
-        # The directory copy still exists, so it's not a fatal error
+    # cp -a: complete copy (preserves permissions, symlinks, timestamps)
+    cp -a "$letsencrypt_dir" "${backup_path}/" 2>/dev/null || {
+        log_error "Backup failed: unable to copy ${letsencrypt_dir}"
+        rm -rf "$backup_path" 2>/dev/null || true
+        return 1
     }
 
-    # Apply secure permissions to backup
-    chmod -R 600 "$backup_file" 2>/dev/null || true
+    # Optional compressed archive (off by default: the directory copy is
+    # already a full backup, and twice-daily runs would double disk usage)
+    if [[ "${BACKUP_ARCHIVE:-false}" == "true" ]]; then
+        backup_file="${backup_dir}/letsencrypt-${timestamp}.tar.gz"
+        if tar -czf "$backup_file" -C /etc letsencrypt 2>/dev/null; then
+            chmod 600 "$backup_file" 2>/dev/null || true
+            log_debug "Compressed archive: ${backup_file}"
+        else
+            rm -f "$backup_file" 2>/dev/null || true
+            log_warning "Failed to create compressed backup archive"
+        fi
+    fi
 
     # Store the backup path for potential rollback
     BACKUP_TIMESTAMP="$timestamp"
     BACKUP_PATH="$backup_path"
 
     log_success "Backup created: ${backup_path}"
-    log_debug "Compressed archive: ${backup_file}"
 
     # Cleanup old backups
     cleanup_old_backups
@@ -91,21 +106,29 @@ restore_letsencrypt() {
     local letsencrypt_dir="/etc/letsencrypt"
     local backup_dir="${BACKUP_DIR:-/var/backups/certbot-smart-manager}"
     local restore_path=""
+    local source_dir=""
+    local extract_dir=""
 
-    # Determine if this is a timestamp or a full path
+    # Resolve the argument: directory path, timestamp, or .tar.gz archive
     if [[ -d "$restore_source" ]]; then
         restore_path="$restore_source"
     elif [[ -d "${backup_dir}/${restore_source}" ]]; then
         restore_path="${backup_dir}/${restore_source}"
-    elif [[ -f "$restore_source" && "$restore_source" == *.tar.gz ]]; then
-        # Restore from compressed archive
-        log_info "Restoring from archive: ${restore_source}"
-        tar -xzf "$restore_source" -C / 2>/dev/null || {
-            log_error "Failed to restore from archive: ${restore_source}"
+    elif [[ -f "$restore_source" && "$restore_source" == *.tar.gz ]] \
+        || [[ -f "${backup_dir}/${restore_source}" && "$restore_source" == *.tar.gz ]]; then
+        local archive="$restore_source"
+        [[ -f "$archive" ]] || archive="${backup_dir}/${restore_source}"
+        extract_dir="$(mktemp -d "${backup_dir}/.extract.XXXXXX")" || {
+            log_error "Unable to create temporary extraction directory"
             return 1
         }
-        log_success "Restored from archive: ${restore_source}"
-        return 0
+        log_info "Extracting archive: ${archive}"
+        if ! tar -xzf "$archive" -C "$extract_dir" 2>/dev/null; then
+            log_error "Failed to extract archive: ${archive}"
+            rm -rf "$extract_dir"
+            return 1
+        fi
+        restore_path="$extract_dir"
     else
         log_error "Backup not found: ${restore_source}"
         echo_error "Available backups:"
@@ -113,50 +136,74 @@ restore_letsencrypt() {
         return 1
     fi
 
-    if [[ ! -d "$restore_path" ]]; then
-        log_error "Backup directory not found: ${restore_path}"
+    # Locate the directory whose contents mirror /etc/letsencrypt.
+    # Supported layouts:
+    #   <path>/letsencrypt/renewal       (current backups and tar archives)
+    #   <path>/renewal                   (older backups: contents copied directly)
+    #   <path>/etc/letsencrypt/renewal   (full-path backups)
+    if [[ -d "${restore_path}/letsencrypt/renewal" ]]; then
+        source_dir="${restore_path}/letsencrypt"
+    elif [[ -d "${restore_path}/renewal" ]]; then
+        source_dir="$restore_path"
+    elif [[ -d "${restore_path}/etc/letsencrypt/renewal" ]]; then
+        source_dir="${restore_path}/etc/letsencrypt"
+    else
+        log_error "Invalid backup structure at: ${restore_path} (no 'renewal' directory found)"
+        [[ -n "$extract_dir" ]] && rm -rf "$extract_dir"
         return 1
     fi
 
-    log_warning "Restoring ${letsencrypt_dir} from ${restore_path}..."
+    log_warning "Restoring ${letsencrypt_dir} from ${source_dir}..."
 
-    # Verify the backup contains expected content
-    if [[ ! -f "${restore_path}/letsencrypt/renewal" ]] && [[ ! -d "${restore_path}/letsencrypt/renewal" ]]; then
-        # Check if the backup is structured as /etc/letsencrypt/ or just letsencrypt/
-        if [[ -d "${restore_path}/renewal" ]]; then
-            # Backup is structured as letsencrypt/ content directly
-            log_debug "Detected backup structure: content of /etc/letsencrypt/"
-        elif [[ -d "${restore_path}/etc/letsencrypt" ]]; then
-            # Backup includes full path
-            log_debug "Detected backup structure: full path /etc/letsencrypt/"
-            restore_path="${restore_path}/etc"
-        else
-            log_error "Invalid backup structure at: ${restore_path}"
-            return 1
-        fi
+    # 1) Stage the restored copy next to the target first. Nothing in
+    #    /etc/letsencrypt is touched until this copy has fully succeeded.
+    local staging="${letsencrypt_dir}.restore.$$"
+    rm -rf "$staging" 2>/dev/null || true
+    if ! cp -a "$source_dir" "$staging" 2>/dev/null; then
+        log_error "Restore failed: unable to copy from ${source_dir}; /etc/letsencrypt was NOT modified"
+        rm -rf "$staging" 2>/dev/null || true
+        [[ -n "$extract_dir" ]] && rm -rf "$extract_dir"
+        return 1
     fi
+    [[ -n "$extract_dir" ]] && rm -rf "$extract_dir"
 
-    # Create a backup of current state before restore (safety net)
+    # 2) Safety net: move the current state aside into the backup directory
     local pre_restore_backup
     pre_restore_backup="${backup_dir}/pre_restore_$(date '+%Y%m%d_%H%M%S')"
     if [[ -d "$letsencrypt_dir" ]]; then
-        cp -a "$letsencrypt_dir" "$pre_restore_backup" 2>/dev/null || true
+        mkdir -p -m 700 "$pre_restore_backup"
+        if ! cp -a "$letsencrypt_dir" "${pre_restore_backup}/" 2>/dev/null; then
+            log_error "Restore aborted: unable to save current state to ${pre_restore_backup}"
+            rm -rf "$staging" "$pre_restore_backup" 2>/dev/null || true
+            return 1
+        fi
         log_warning "Pre-restore backup saved to: ${pre_restore_backup}"
     fi
 
-    # Perform the restore
-    rm -rf "$letsencrypt_dir" 2>/dev/null || true
-    cp -a "${restore_path}/letsencrypt" /etc/ 2>/dev/null || {
-        log_error "Restore failed: unable to copy from ${restore_path}"
+    # 3) Swap: rename current -> .old, staging -> current (renames on the
+    #    same filesystem, so the window without /etc/letsencrypt is tiny)
+    local old_dir="${letsencrypt_dir}.old.$$"
+    if [[ -d "$letsencrypt_dir" ]]; then
+        mv "$letsencrypt_dir" "$old_dir" || {
+            log_error "Restore failed: unable to move current ${letsencrypt_dir} aside"
+            rm -rf "$staging" 2>/dev/null || true
+            return 1
+        }
+    fi
+    if ! mv "$staging" "$letsencrypt_dir"; then
+        log_error "Restore failed: unable to put restored copy in place; reverting"
+        [[ -d "$old_dir" ]] && mv "$old_dir" "$letsencrypt_dir"
+        rm -rf "$staging" 2>/dev/null || true
         return 1
-    }
+    fi
+    rm -rf "$old_dir" 2>/dev/null || true
 
     # Restore SELinux context if SELinux is enabled
     if command -v restorecon >/dev/null 2>&1; then
         restorecon -R "$letsencrypt_dir" 2>/dev/null || true
     fi
 
-    log_success "Restore completed from: ${restore_path}"
+    log_success "Restore completed from: ${restore_source}"
 
     # Reload web server to pick up restored certificates
     if [[ "${RELOAD_WEB_SERVER:-true}" == "true" ]]; then

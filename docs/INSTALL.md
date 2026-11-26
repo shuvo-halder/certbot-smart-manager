@@ -45,13 +45,13 @@ Comprehensive installation and setup instructions.
 ### Method 1: curl (One-Liner)
 
 ```bash
-curl -sSL https://your-domain/install.sh | sudo bash
+curl -sSL https://raw.githubusercontent.com/shuvo-halder/certbot-smart-manager/main/install.sh | sudo bash
 ```
 
 ### Method 2: wget
 
 ```bash
-wget -O - https://your-domain/install.sh | sudo bash
+wget -O - https://raw.githubusercontent.com/shuvo-halder/certbot-smart-manager/main/install.sh | sudo bash
 ```
 
 ### Method 3: Local Install (from cloned repo)
@@ -143,7 +143,7 @@ systemctl start certbot-smart.timer
 
 If systemd is not available, adds a cron entry:
 ```
-0 3,15 * * * /usr/local/bin/ssl-manager --auto >> /var/log/certbot-smart-manager.log 2>&1
+0 3,15 * * * /usr/local/bin/ssl-manager --auto >/dev/null 2>&1
 ```
 
 ### Step 13: Verification
@@ -166,17 +166,18 @@ Verifies all installed components and prints a summary.
 
 ## 🔄 Idempotency
 
-The installer uses marker files in `/etc/certbot-smart-manager/.install-state/` to track completed steps. This means:
+Every run of the installer is safe:
 
-- **Running the installer again** will skip already-completed steps
-- **Upgrading** will update scripts and systemd files without modifying your configuration
-- **Safe to rerun** at any time
+- **Scripts, modules and systemd units are always refreshed**, so re-running the installer upgrades an existing installation
+- **Your configuration is never overwritten** (`/etc/certbot-smart-manager/certbot-smart.conf`)
+- **Package installation is skipped** after the first successful run (marker: `/etc/certbot-smart-manager/.install-state/dependencies.done`)
+- Units installed by older versions under the name `certbot-smart-manager.{service,timer}` are removed automatically and replaced by `certbot-smart.{service,timer}`
+- If an upgrade fails, rollback only removes files that run created — a previously working installation is left in place
 
-To force a reinstall of a specific component, remove the corresponding marker file:
+To force the dependency step to run again:
 
 ```bash
-# Reinstall scripts only
-sudo rm -f /etc/certbot-smart-manager/.install-state/scripts.done
+sudo rm -f /etc/certbot-smart-manager/.install-state/dependencies.done
 sudo bash install.sh
 ```
 
@@ -188,7 +189,7 @@ To upgrade to the latest version:
 
 ```bash
 # Re-run the installer (safe, idempotent)
-curl -sSL https://your-domain/install.sh | sudo bash
+curl -sSL https://raw.githubusercontent.com/shuvo-halder/certbot-smart-manager/main/install.sh | sudo bash
 ```
 
 Or from a cloned repository:
@@ -203,7 +204,22 @@ sudo bash install.sh
 
 ## ❌ Uninstallation
 
-To completely remove certbot-smart-manager:
+To completely remove certbot-smart-manager, use the uninstaller:
+
+```bash
+# From a cloned repository
+sudo bash uninstall.sh
+
+# Or directly
+curl -sSL https://raw.githubusercontent.com/shuvo-halder/certbot-smart-manager/main/uninstall.sh | sudo bash
+
+# Non-interactive (answers "yes" to all prompts, including deleting backups)
+curl -sSL https://raw.githubusercontent.com/shuvo-halder/certbot-smart-manager/main/uninstall.sh | sudo ASSUME_YES=1 bash
+```
+
+The uninstaller never touches `/etc/letsencrypt` (your certificates). It asks separately before deleting the backup directory.
+
+Manual removal, if needed:
 
 ```bash
 # Stop and disable timer
@@ -242,7 +258,7 @@ docker run --rm -it \
   --network host \
   ubuntu:22.04 bash -c "
     apt-get update && apt-get install -y curl sudo
-    curl -sSL https://your-domain/install.sh | sudo bash
+    curl -sSL https://raw.githubusercontent.com/shuvo-halder/certbot-smart-manager/main/install.sh | sudo bash
   "
 ```
 
@@ -320,6 +336,7 @@ Full configuration file: `/etc/certbot-smart-manager/certbot-smart.conf`
 | `BACKUP_ENABLED` | `true` | Enable automatic backup before renewal |
 | `BACKUP_DIR` | `/var/backups/certbot-smart-manager` | Backup storage location |
 | `BACKUP_RETENTION_DAYS` | `30` | Days to keep old backups |
+| `BACKUP_ARCHIVE` | `false` | Also write a `.tar.gz` archive next to each directory backup |
 | `NOTIFICATION_METHOD` | `console` | Default notification method |
 | `SMTP_SERVER` | — | SMTP server for email notifications |
 | `SMTP_PORT` | `587` | SMTP port |

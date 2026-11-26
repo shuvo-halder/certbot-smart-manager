@@ -6,8 +6,8 @@
 # =============================================================================
 #
 # Usage:
-#   curl -sSL https://your-domain/uninstall.sh | sudo bash
-#   wget -O - https://your-domain/uninstall.sh | sudo bash
+#   curl -sSL https://raw.githubusercontent.com/shuvo-halder/certbot-smart-manager/main/uninstall.sh | sudo bash
+#   wget -O - https://raw.githubusercontent.com/shuvo-halder/certbot-smart-manager/main/uninstall.sh | sudo bash
 #   sudo ./uninstall.sh
 #
 # This script:
@@ -38,9 +38,15 @@ BIN_DEST="/usr/local/bin"
 CONFIG_DIR="/etc/${PROJECT_NAME}"
 LOG_FILE="/var/log/${PROJECT_NAME}.log"
 LOCK_FILE="/var/lock/${PROJECT_NAME}.lock"
+STATE_DIR="/var/lib/${PROJECT_NAME}"
+DEPLOY_HOOK="/etc/letsencrypt/renewal-hooks/deploy/${PROJECT_NAME}-reload.sh"
 BACKUP_DIR="/var/backups/${PROJECT_NAME}"
 SYSTEMD_DIR="/etc/systemd/system"
 CRON_DIR="/etc/cron.d"
+
+# Systemd unit base names: current, and the one used by older installers
+UNIT_NAME="certbot-smart"
+LEGACY_UNIT_NAME="certbot-smart-manager"
 
 # =============================================================================
 # UTILITY FUNCTIONS
@@ -58,12 +64,31 @@ separator() {
 }
 
 # Utility: prompt yes/no (default: no)
-# Returns 0 for yes, 1 for no
+# Returns 0 for yes, 1 for no.
+# Reads from /dev/tty: when run as `curl ... | sudo bash`, stdin IS the
+# script itself, so a plain `read` would consume script lines as answers.
+# Set ASSUME_YES=1 for non-interactive use (answers "yes" to everything).
 prompt_yes_no() {
     local prompt="$1"
-    local response
+    local response=""
+
+    if [[ "${ASSUME_YES:-0}" == "1" ]]; then
+        printf '%s [y/N]: y (ASSUME_YES=1)\n' "$prompt"
+        return 0
+    fi
+
     printf '%s [y/N]: ' "$prompt"
-    read -r response
+    if [[ -t 0 ]]; then
+        read -r response || response=""
+    elif { exec 3</dev/tty; } 2>/dev/null; then
+        read -r response <&3 || response=""
+        exec 3<&-
+    else
+        printf '\n'
+        echo_warning "No terminal available to answer; assuming 'no'. (Set ASSUME_YES=1 to skip prompts.)"
+        return 1
+    fi
+
     case "$(printf '%s' "$response" | tr '[:upper:]' '[:lower:]')" in
         y|yes) return 0 ;;
         *)     return 1 ;;
@@ -105,8 +130,11 @@ cleanup_systemd() {
         fi
     }
 
-    _stop_disable_unit "${PROJECT_NAME}.timer"
-    _stop_disable_unit "${PROJECT_NAME}.service"
+    _stop_disable_unit "${UNIT_NAME}.timer"
+    _stop_disable_unit "${UNIT_NAME}.service"
+    # Units installed by older installer versions
+    _stop_disable_unit "${LEGACY_UNIT_NAME}.timer"
+    _stop_disable_unit "${LEGACY_UNIT_NAME}.service"
 
     # Reload systemd daemon to forget removed units
     if command_exists systemctl; then
@@ -151,6 +179,25 @@ remove_config() {
         echo_success "Configuration removed: ${CONFIG_DIR}/"
     else
         echo_info "Configuration not found (already clean): ${CONFIG_DIR}/"
+    fi
+}
+
+# Step 4b: Remove the certbot deploy hook and the state directory.
+# Only OUR hook file is removed — /etc/letsencrypt itself (certificates,
+# keys, other hooks) is never touched.
+remove_hook_and_state() {
+    echo_info "Removing certbot deploy hook and state directory..."
+
+    if [[ -f "$DEPLOY_HOOK" ]]; then
+        rm -f "$DEPLOY_HOOK"
+        echo_success "Deploy hook removed: ${DEPLOY_HOOK}"
+    else
+        echo_info "Deploy hook not found (already clean): ${DEPLOY_HOOK}"
+    fi
+
+    if [[ -d "$STATE_DIR" ]]; then
+        rm -rf "$STATE_DIR"
+        echo_success "State directory removed: ${STATE_DIR}/"
     fi
 }
 
@@ -232,9 +279,10 @@ cleanup_cron() {
 # Step 8: Optionally remove backup directory
 remove_backups() {
     echo ""
-    echo_info "Backup directory found: ${BACKUP_DIR}/"
 
     if [[ -d "$BACKUP_DIR" ]]; then
+        echo_info "Backup directory found: ${BACKUP_DIR}/"
+        echo_warning "  It contains copies of /etc/letsencrypt, including PRIVATE KEYS."
         local backup_size
         backup_size="$(du -sh "$BACKUP_DIR" 2>/dev/null | awk '{print $1}')"
         echo_info "  Current size: ${backup_size}"
@@ -276,14 +324,14 @@ verify_uninstall() {
     fi
 
     # Check systemd units gone
-    if [[ -f "${SYSTEMD_DIR}/${PROJECT_NAME}.service" ]]; then
-        echo_warning "  Systemd service still exists: ${PROJECT_NAME}.service"
-        errors=$((errors + 1))
-    fi
-    if [[ -f "${SYSTEMD_DIR}/${PROJECT_NAME}.timer" ]]; then
-        echo_warning "  Systemd timer still exists: ${PROJECT_NAME}.timer"
-        errors=$((errors + 1))
-    fi
+    local unit
+    for unit in "${UNIT_NAME}.service" "${UNIT_NAME}.timer" \
+                "${LEGACY_UNIT_NAME}.service" "${LEGACY_UNIT_NAME}.timer"; do
+        if [[ -f "${SYSTEMD_DIR}/${unit}" ]]; then
+            echo_warning "  Systemd unit still exists: ${unit}"
+            errors=$((errors + 1))
+        fi
+    done
 
     if [[ $errors -eq 0 ]]; then
         echo_success "All traces removed successfully."
@@ -320,7 +368,7 @@ main() {
     # -----------------------------------------------------------------------
     if [[ "${EUID:-$(id -u)}" -ne 0 ]]; then
         echo_error "This script must be run as root."
-        echo_error "Usage: curl -sSL https://your-domain/uninstall.sh | sudo bash"
+        echo_error "Usage: curl -sSL https://raw.githubusercontent.com/shuvo-halder/certbot-smart-manager/main/uninstall.sh | sudo bash"
         exit 1
     fi
     echo_success "Running as root."
@@ -334,9 +382,11 @@ main() {
     echo "  - ${BIN_DEST}/${SCRIPT_NAME}        (symlink)"
     echo "  - ${LIB_DEST}/                      (library & modules)"
     echo "  - ${CONFIG_DIR}/                    (configuration)"
+    echo "  - ${DEPLOY_HOOK}  (certbot deploy hook)"
+    echo "  - ${STATE_DIR}/                     (notification state)"
     echo "  - ${LOG_FILE}                       (log file)"
     echo "  - ${LOCK_FILE}                      (lock file)"
-    echo "  - systemd units: ${PROJECT_NAME}.service, .timer"
+    echo "  - systemd units: ${UNIT_NAME}.service, ${UNIT_NAME}.timer"
     echo "  - cron entries for ${SCRIPT_NAME}"
     echo ""
     echo_info "The backup directory (${BACKUP_DIR}/) will be handled separately."
@@ -365,6 +415,7 @@ main() {
 
     echo_bold "--- Step 4/8: Remove Configuration ---"
     remove_config
+    remove_hook_and_state
     separator
 
     echo_bold "--- Step 5/8: Remove Log File ---"
@@ -388,7 +439,8 @@ main() {
     # -----------------------------------------------------------------------
     echo ""
     echo_bold "=== Verification ==="
-    verify_uninstall
+    # Non-fatal: under `set -e` a non-zero return would skip the summary
+    verify_uninstall || true
 
     # -----------------------------------------------------------------------
     # 5. Final message

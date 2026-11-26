@@ -6,17 +6,19 @@
 # =============================================================================
 #
 # Usage:
-#   curl -sSL https://your-domain/install.sh | sudo bash
-#   wget -O - https://your-domain/install.sh | sudo bash
+#   curl -sSL https://raw.githubusercontent.com/shuvo-halder/certbot-smart-manager/main/install.sh | sudo bash
+#   wget -O - https://raw.githubusercontent.com/shuvo-halder/certbot-smart-manager/main/install.sh | sudo bash
+#   sudo bash install.sh            (from a cloned repository)
 #
 # This script:
-#   - Detects Linux OS (Ubuntu/Debian/CentOS/RHEL/Rocky/AlmaLinux/Fedora)
-#   - Installs dependencies (curl, wget, openssl, certbot, plugins)
+#   - Detects Linux OS (Ubuntu/Debian/CentOS/RHEL/Rocky/AlmaLinux/Fedora/Oracle)
+#   - Installs dependencies (curl, wget, openssl, tar, certbot, plugins)
+#   - Downloads the project sources when run via a pipe (curl | bash)
 #   - Creates required directories and sets permissions
-#   - Installs the main script and modules
+#   - Installs (or upgrades) the main script and modules
 #   - Creates systemd service + timer
 #   - Creates cron fallback if systemd is unavailable
-#   - Is fully idempotent (safe for multiple runs)
+#   - Is fully idempotent (safe for multiple runs; re-running upgrades)
 #
 # =============================================================================
 
@@ -27,33 +29,41 @@ umask 027
 # =============================================================================
 # CONSTANTS
 # =============================================================================
-VERSION="1.0.0"
+INSTALLER_VERSION="1.0.0"
 PROJECT_NAME="certbot-smart-manager"
 SCRIPT_NAME="ssl-manager"
+
+# Names of the shipped files (must match the files in this repository)
+CONFIG_NAME="certbot-smart.conf"
+UNIT_NAME="certbot-smart"
+
+# Names used by older installer versions — migrated/removed on upgrade
+LEGACY_UNIT_NAME="certbot-smart-manager"
+LEGACY_CONFIG_NAME="certbot-smart-manager.conf"
 
 # Installation paths
 LIB_DEST="/usr/local/lib/${PROJECT_NAME}"
 MODULES_DEST="${LIB_DEST}/modules"
 BIN_DEST="/usr/local/bin"
 CONFIG_DIR="/etc/${PROJECT_NAME}"
+CONFIG_DEST="${CONFIG_DIR}/${CONFIG_NAME}"
 LOG_FILE="/var/log/${PROJECT_NAME}.log"
 LOCK_FILE="/var/lock/${PROJECT_NAME}.lock"
 BACKUP_DIR="/var/backups/${PROJECT_NAME}"
+STATE_DIR="/var/lib/${PROJECT_NAME}"
 SYSTEMD_DIR="/etc/systemd/system"
+# certbot runs every executable here after each successful renewal
+DEPLOY_HOOK_DEST="/etc/letsencrypt/renewal-hooks/deploy/${PROJECT_NAME}-reload.sh"
 
-# Script source paths (relative to install.sh)
-SRC_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-MAIN_SCRIPT_SRC="${SRC_DIR}/src/${PROJECT_NAME}.sh"
-MODULES_SRC="${SRC_DIR}/src/modules"
-CONFIG_SRC="${SRC_DIR}/config/${PROJECT_NAME}.conf"
-SERVICE_SRC="${SRC_DIR}/systemd/${PROJECT_NAME}.service"
-TIMER_SRC="${SRC_DIR}/systemd/${PROJECT_NAME}.timer"
+# Where to download the sources from when not run from a checkout
+REPO_TARBALL_URL="${REPO_TARBALL_URL:-https://github.com/shuvo-halder/certbot-smart-manager/archive/refs/heads/main.tar.gz}"
 
-# Install state markers (for idempotency)
+# Install state markers (for idempotency of slow steps)
 INSTALL_MARKER_DIR="${CONFIG_DIR}/.install-state"
 
-# Operation log (for rollback)
-INSTALL_LOG="/tmp/${PROJECT_NAME}-install.log"
+# Temporary working files (created securely below)
+INSTALL_LOG=""
+DOWNLOAD_DIR=""
 
 # =============================================================================
 # INITIALIZATION
@@ -62,12 +72,35 @@ INSTALL_LOG="/tmp/${PROJECT_NAME}-install.log"
 # Ensure we're running as root
 if [[ "${EUID:-$(id -u)}" -ne 0 ]]; then
     printf 'ERROR: This script must be run as root.\n' >&2
-    printf 'Usage: curl -sSL https://your-domain/install.sh | sudo bash\n' >&2
+    printf 'Usage: curl -sSL https://raw.githubusercontent.com/shuvo-halder/certbot-smart-manager/main/install.sh | sudo bash\n' >&2
     exit 1
 fi
 
-# Clear previous install log
-: > "$INSTALL_LOG"
+# Operation log for rollback. mktemp — a fixed /tmp path written as root
+# could be pre-created as a symlink by another user.
+INSTALL_LOG="$(mktemp "/tmp/${PROJECT_NAME}-install.XXXXXX")"
+
+# =============================================================================
+# SOURCE PATHS
+# =============================================================================
+
+# When piped (curl | bash) BASH_SOURCE is empty; fall back to $0 / cwd.
+set_source_paths() {
+    SRC_DIR="$1"
+    MAIN_SCRIPT_SRC="${SRC_DIR}/src/${PROJECT_NAME}.sh"
+    MODULES_SRC="${SRC_DIR}/src/modules"
+    CONFIG_SRC="${SRC_DIR}/config/${CONFIG_NAME}"
+    SERVICE_SRC="${SRC_DIR}/systemd/${UNIT_NAME}.service"
+    TIMER_SRC="${SRC_DIR}/systemd/${UNIT_NAME}.timer"
+    HOOK_SRC="${SRC_DIR}/hooks/deploy-reload.sh"
+}
+
+_self="${BASH_SOURCE[0]:-$0}"
+if [[ -f "$_self" ]]; then
+    set_source_paths "$(cd "$(dirname "$_self")" && pwd)"
+else
+    set_source_paths "$(pwd)"
+fi
 
 # =============================================================================
 # UTILITY FUNCTIONS
@@ -103,19 +136,58 @@ _mark_step_done() {
     chmod 400 "${INSTALL_MARKER_DIR}/${step_name}.done"
 }
 
+# Install a file; record it for rollback only if it did not exist before
+# (so a failed upgrade never deletes a previously working installation).
+_install_file() {
+    local mode="$1" src="$2" dest="$3"
+    local existed=false
+    [[ -e "$dest" ]] && existed=true
+    install -m "$mode" "$src" "$dest"
+    if [[ "$existed" == "false" ]]; then
+        _log_operation "file:${dest}"
+    fi
+}
+
+# Install a text file with CR characters stripped (protects against files
+# checked out with Windows CRLF line endings, which break systemd / bash)
+_install_text_file() {
+    local mode="$1" src="$2" dest="$3" tmp
+    tmp="$(mktemp)"
+    tr -d '\r' < "$src" > "$tmp"
+    _install_file "$mode" "$tmp" "$dest"
+    rm -f "$tmp"
+}
+
+# Remove temporary files on exit
+_cleanup_tmp() {
+    [[ -n "$INSTALL_LOG" ]] && rm -f "$INSTALL_LOG" 2>/dev/null
+    [[ -n "$DOWNLOAD_DIR" ]] && rm -rf "$DOWNLOAD_DIR" 2>/dev/null
+    return 0
+}
+trap _cleanup_tmp EXIT
+
 # =============================================================================
 # OS DETECTION
 # =============================================================================
+
+# Read a field from /etc/os-release in a subshell. Sourcing it directly
+# would overwrite variables such as VERSION and NAME in this script.
+os_release_field() {
+    local field="$1"
+    (
+        # shellcheck disable=SC1091
+        . /etc/os-release
+        printf '%s' "${!field:-unknown}"
+    )
+}
 
 detect_os() {
     echo_info "Detecting operating system..."
 
     if [[ -r /etc/os-release ]]; then
-        # shellcheck disable=SC1091
-        source /etc/os-release
-        OS_ID="${ID:-unknown}"
-        OS_VERSION="${VERSION_ID:-unknown}"
-        OS_NAME="${NAME:-unknown}"
+        OS_ID="$(os_release_field ID)"
+        OS_VERSION="$(os_release_field VERSION_ID)"
+        OS_NAME="$(os_release_field NAME)"
     elif [[ -r /etc/redhat-release ]]; then
         OS_NAME="$(cat /etc/redhat-release)"
         if grep -qi "centos" /etc/redhat-release 2>/dev/null; then OS_ID="centos"
@@ -134,7 +206,6 @@ detect_os() {
 
     echo_info "Detected: ${OS_ID} ${OS_VERSION} (${OS_NAME})"
 
-    # Supported OS check
     case "$OS_ID" in
         ubuntu|debian|centos|rhel|rocky|almalinux|fedora|ol)
             return 0
@@ -150,68 +221,50 @@ detect_os() {
 # PACKAGE MANAGER DETECTION
 # =============================================================================
 
+_set_apt() {
+    PKG_MANAGER="apt"
+    PKG_INSTALL="DEBIAN_FRONTEND=noninteractive apt-get install -y"
+    PKG_UPDATE="apt-get update -qq"
+    NEEDS_EPEL=false
+}
+
+_set_dnf_yum() {
+    if command_exists dnf; then
+        PKG_MANAGER="dnf"
+        PKG_INSTALL="dnf install -y"
+        PKG_UPDATE="dnf makecache"
+    else
+        PKG_MANAGER="yum"
+        PKG_INSTALL="yum install -y"
+        PKG_UPDATE="yum makecache"
+    fi
+}
+
 get_package_manager() {
+    CERTBOT_PACKAGE="certbot"
+    CERTBOT_PLUGIN_NGINX="python3-certbot-nginx"
+    CERTBOT_PLUGIN_APACHE="python3-certbot-apache"
+    DEPS="curl wget openssl ca-certificates tar"
+
     case "$OS_ID" in
         ubuntu|debian)
-            PKG_MANAGER="apt"
-            PKG_INSTALL="DEBIAN_FRONTEND=noninteractive apt-get install -y"
-            PKG_UPDATE="apt-get update -qq"
-            CERTBOT_PACKAGE="certbot"
-            CERTBOT_PLUGIN_NGINX="python3-certbot-nginx"
-            CERTBOT_PLUGIN_APACHE="python3-certbot-apache"
-            DEPS="curl wget openssl ca-certificates systemd"
+            _set_apt
             ;;
         centos|rhel|rocky|almalinux|ol)
-            if command_exists dnf; then
-                PKG_MANAGER="dnf"
-                PKG_INSTALL="dnf install -y"
-                PKG_UPDATE="dnf makecache"
-            else
-                PKG_MANAGER="yum"
-                PKG_INSTALL="yum install -y"
-                PKG_UPDATE="yum makecache"
-            fi
-            # EPEL is required for certbot on RHEL/CentOS
-            CERTBOT_PACKAGE="certbot"
-            CERTBOT_PLUGIN_NGINX="python3-certbot-nginx"
-            CERTBOT_PLUGIN_APACHE="python3-certbot-apache"
-            DEPS="curl wget openssl ca-certificates systemd epel-release"
+            _set_dnf_yum
+            # EPEL is required for certbot on RHEL-family systems
+            NEEDS_EPEL=true
             ;;
         fedora)
-            PKG_MANAGER="dnf"
-            PKG_INSTALL="dnf install -y"
-            PKG_UPDATE="dnf makecache"
-            CERTBOT_PACKAGE="certbot"
-            CERTBOT_PLUGIN_NGINX="python3-certbot-nginx"
-            CERTBOT_PLUGIN_APACHE="python3-certbot-apache"
-            DEPS="curl wget openssl ca-certificates systemd"
+            _set_dnf_yum
+            NEEDS_EPEL=false
             ;;
         *)
-            # Fallback: try to detect available package manager
-            if command_exists apt; then
-                PKG_MANAGER="apt"
-                PKG_INSTALL="DEBIAN_FRONTEND=noninteractive apt-get install -y"
-                PKG_UPDATE="apt-get update -qq"
-                CERTBOT_PACKAGE="certbot"
-                CERTBOT_PLUGIN_NGINX="python3-certbot-nginx"
-                CERTBOT_PLUGIN_APACHE="python3-certbot-apache"
-                DEPS="curl wget openssl ca-certificates systemd"
-            elif command_exists dnf; then
-                PKG_MANAGER="dnf"
-                PKG_INSTALL="dnf install -y"
-                PKG_UPDATE="dnf makecache"
-                CERTBOT_PACKAGE="certbot"
-                CERTBOT_PLUGIN_NGINX="python3-certbot-nginx"
-                CERTBOT_PLUGIN_APACHE="python3-certbot-apache"
-                DEPS="curl wget openssl ca-certificates systemd"
-            elif command_exists yum; then
-                PKG_MANAGER="yum"
-                PKG_INSTALL="yum install -y"
-                PKG_UPDATE="yum makecache"
-                CERTBOT_PACKAGE="certbot"
-                CERTBOT_PLUGIN_NGINX="python3-certbot-nginx"
-                CERTBOT_PLUGIN_APACHE="python3-certbot-apache"
-                DEPS="curl wget openssl ca-certificates systemd epel-release"
+            if command_exists apt-get; then
+                _set_apt
+            elif command_exists dnf || command_exists yum; then
+                _set_dnf_yum
+                NEEDS_EPEL=true
             else
                 echo_error "No supported package manager found (apt, dnf, yum)."
                 echo_error "Please install dependencies manually and re-run."
@@ -235,206 +288,205 @@ install_dependencies() {
     fi
 
     echo_info "Updating package lists..."
-    eval "$PKG_UPDATE" 2>/dev/null || echo_warning "Package update failed; continuing..."
+    eval "$PKG_UPDATE" >/dev/null 2>&1 || echo_warning "Package update failed; continuing..."
 
-    echo_info "Installing dependencies: ${DEPS}..."
-    eval "$PKG_INSTALL $DEPS" 2>/dev/null || {
-        echo_warning "Some dependencies could not be installed; continuing..."
-    }
+    # EPEL is installed separately: if it is unavailable (e.g. on RHEL
+    # without the EPEL repo configured) it must not make dnf/yum reject the
+    # whole dependency list.
+    if [[ "${NEEDS_EPEL:-false}" == "true" ]]; then
+        echo_info "Installing EPEL repository..."
+        eval "$PKG_INSTALL epel-release" >/dev/null 2>&1 \
+            || echo_warning "epel-release could not be installed; certbot may be unavailable. See https://docs.fedoraproject.org/en-US/epel/"
+    fi
+
+    echo_info "Installing dependencies: ${DEPS//$'\n'/ }..."
+    local pkg failed=()
+    if ! eval "$PKG_INSTALL $DEPS" >/dev/null 2>&1; then
+        # Retry one by one so a single missing package does not block the rest
+        for pkg in curl wget openssl ca-certificates tar; do
+            eval "$PKG_INSTALL $pkg" >/dev/null 2>&1 || failed+=("$pkg")
+        done
+    fi
+    if [[ ${#failed[@]} -gt 0 ]]; then
+        echo_warning "Could not install: $(IFS=' '; printf '%s' "${failed[*]}"); continuing..."
+    fi
 
     _mark_step_done "dependencies"
-    _log_operation "deps:installed"
     echo_success "Dependencies installed."
 }
 
-# Step 2: Install Certbot if not present
-install_certbot() {
-    if _is_step_done "certbot"; then
-        echo_success "Certbot already installed (idempotent)."
+# Step 2: Make sure the project sources are available.
+# When run as `curl ... | bash` there is no checkout next to this script,
+# so download the release tarball.
+ensure_sources() {
+    if [[ -f "$MAIN_SCRIPT_SRC" ]] && [[ -d "$MODULES_SRC" ]]; then
+        echo_success "Using local sources: ${SRC_DIR}"
         return 0
     fi
 
+    echo_info "Local sources not found; downloading ${REPO_TARBALL_URL}..."
+    DOWNLOAD_DIR="$(mktemp -d "/tmp/${PROJECT_NAME}-src.XXXXXX")"
+
+    local tarball="${DOWNLOAD_DIR}/source.tar.gz"
+    if command_exists curl; then
+        curl -fsSL "$REPO_TARBALL_URL" -o "$tarball"
+    elif command_exists wget; then
+        wget -q -O "$tarball" "$REPO_TARBALL_URL"
+    else
+        echo_error "Neither curl nor wget is available to download the sources."
+        return 1
+    fi
+
+    tar -xzf "$tarball" -C "$DOWNLOAD_DIR"
+
+    local extracted
+    extracted="$(find "$DOWNLOAD_DIR" -mindepth 1 -maxdepth 1 -type d | head -n 1)"
+    if [[ -z "$extracted" ]] || [[ ! -f "${extracted}/src/${PROJECT_NAME}.sh" ]]; then
+        echo_error "Downloaded archive does not contain the expected project layout."
+        return 1
+    fi
+
+    set_source_paths "$extracted"
+    echo_success "Sources downloaded."
+}
+
+# Step 3: Install Certbot if not present
+install_certbot() {
     if command_exists certbot; then
         echo_success "Certbot is already installed."
-        _mark_step_done "certbot"
         return 0
     fi
 
     echo_info "Installing Certbot..."
 
-    # Try to install certbot via package manager
-    if eval "$PKG_INSTALL $CERTBOT_PACKAGE" 2>/dev/null; then
+    if eval "$PKG_INSTALL $CERTBOT_PACKAGE" >/dev/null 2>&1 && command_exists certbot; then
         echo_success "Certbot installed."
     else
         echo_warning "Certbot package installation failed."
         echo_warning "Attempting snap installation (Ubuntu 20.04+ recommended method)..."
 
         if command_exists snap; then
-            snap install core && snap refresh core 2>/dev/null || true
-            snap install --classic certbot 2>/dev/null && {
+            { snap install core && snap refresh core; } >/dev/null 2>&1 || true
+            if snap install --classic certbot >/dev/null 2>&1; then
                 ln -sf /snap/bin/certbot /usr/bin/certbot 2>/dev/null || true
                 echo_success "Certbot installed via snap."
-            } || {
+            else
                 echo_warning "Snap installation failed."
                 echo_warning "Please install certbot manually: https://certbot.eff.org"
-            }
+            fi
         else
             echo_warning "snap not available."
             echo_warning "Please install certbot manually: https://certbot.eff.org"
         fi
     fi
-
-    _mark_step_done "certbot"
-    _log_operation "certbot:installed"
 }
 
-# Step 3: Install Certbot plugins
+# Step 4: Install Certbot plugins (only for detected web servers)
 install_certbot_plugins() {
-    if _is_step_done "certbot-plugins"; then
-        echo_success "Certbot plugins already installed (idempotent)."
-        return 0
-    fi
+    echo_info "Checking Certbot plugins..."
 
-    echo_info "Installing Certbot plugins..."
-
-    # Try nginx plugin
     if command_exists nginx || systemctl is-active --quiet nginx 2>/dev/null; then
-        if eval "$PKG_INSTALL $CERTBOT_PLUGIN_NGINX" 2>/dev/null; then
+        if eval "$PKG_INSTALL $CERTBOT_PLUGIN_NGINX" >/dev/null 2>&1; then
             echo_success "Certbot nginx plugin installed."
         else
-            echo_warning "Could not install certbot nginx plugin."
+            echo_warning "Could not install certbot nginx plugin (${CERTBOT_PLUGIN_NGINX})."
         fi
     fi
 
-    # Try apache plugin
-    if systemctl is-active --quiet apache2 2>/dev/null || systemctl is-active --quiet httpd 2>/dev/null; then
-        if eval "$PKG_INSTALL $CERTBOT_PLUGIN_APACHE" 2>/dev/null; then
+    if command_exists apache2 || command_exists httpd \
+        || systemctl is-active --quiet apache2 2>/dev/null || systemctl is-active --quiet httpd 2>/dev/null; then
+        if eval "$PKG_INSTALL $CERTBOT_PLUGIN_APACHE" >/dev/null 2>&1; then
             echo_success "Certbot apache plugin installed."
         else
-            echo_warning "Could not install certbot apache plugin."
+            echo_warning "Could not install certbot apache plugin (${CERTBOT_PLUGIN_APACHE})."
         fi
     fi
-
-    _mark_step_done "certbot-plugins"
-    _log_operation "plugins:installed"
 }
 
-# Step 4: Create directory structure
+# Step 5: Create directory structure
 create_directories() {
-    if _is_step_done "directories"; then
-        echo_success "Directories already exist (idempotent)."
-        return 0
-    fi
-
     echo_info "Creating directory structure..."
 
     local dirs=(
         "$LIB_DEST"
         "$MODULES_DEST"
         "$CONFIG_DIR"
-        "$(dirname "$LOG_FILE")"
-        "$(dirname "$LOCK_FILE")"
         "$BACKUP_DIR"
+        "$STATE_DIR"
     )
 
     local dir
     for dir in "${dirs[@]}"; do
-        mkdir -p "$dir" 2>/dev/null || true
-        chmod 755 "$dir" 2>/dev/null || true
-        _log_operation "dir:${dir}"
+        if [[ ! -d "$dir" ]]; then
+            mkdir -p "$dir"
+            _log_operation "dir:${dir}"
+        fi
     done
 
-    _mark_step_done "directories"
     echo_success "Directories created."
 }
 
-# Step 5: Install main script and modules
+# Step 6: Install (or upgrade) main script and modules.
+# Always runs, so re-running the installer upgrades an existing install.
 install_scripts() {
-    if _is_step_done "scripts"; then
-        echo_success "Scripts already installed (idempotent)."
-        return 0
-    fi
-
     echo_info "Installing main script and modules..."
 
-    # Install main script
-    if [[ -f "$MAIN_SCRIPT_SRC" ]]; then
-        install -m 755 "$MAIN_SCRIPT_SRC" "${LIB_DEST}/${PROJECT_NAME}.sh"
-        chmod +x "${LIB_DEST}/${PROJECT_NAME}.sh"
-        _log_operation "file:${LIB_DEST}/${PROJECT_NAME}.sh"
-        echo_success "Main script installed."
-    else
+    if [[ ! -f "$MAIN_SCRIPT_SRC" ]]; then
         echo_error "Main script not found: ${MAIN_SCRIPT_SRC}"
-        echo_error "Installation aborted."
         rollback_install "Main script source missing."
-        exit 1
     fi
 
-    # Install modules
+    _install_text_file 755 "$MAIN_SCRIPT_SRC" "${LIB_DEST}/${PROJECT_NAME}.sh"
+    echo_success "Main script installed."
+
     if [[ -d "$MODULES_SRC" ]]; then
         local module
         for module in "${MODULES_SRC}"/*.sh; do
-            if [[ -f "$module" ]]; then
-                install -m 640 "$module" "$MODULES_DEST/"
-                _log_operation "file:${MODULES_DEST}/$(basename "$module")"
-            fi
+            [[ -f "$module" ]] || continue
+            _install_text_file 640 "$module" "${MODULES_DEST}/$(basename "$module")"
         done
         echo_success "Modules installed (${MODULES_DEST})."
     else
-        echo_warning "Module directory not found: ${MODULES_SRC}"
+        rollback_install "Module directory not found: ${MODULES_SRC}"
     fi
 
-    # Ensure target script is definitely executable
-    chmod +x "${LIB_DEST}/${PROJECT_NAME}.sh" 2>/dev/null || true
+    # Symlink at /usr/local/bin/ssl-manager
+    local link="${BIN_DEST}/${SCRIPT_NAME}"
+    local link_existed=false
+    [[ -L "$link" || -e "$link" ]] && link_existed=true
+    ln -sfn "${LIB_DEST}/${PROJECT_NAME}.sh" "$link"
+    [[ "$link_existed" == "false" ]] && _log_operation "symlink:${link}"
+    echo_success "Symlink created: ${link}"
 
-    # Create symlink at /usr/local/bin/ssl-manager
-    ln -sf "${LIB_DEST}/${PROJECT_NAME}.sh" "${BIN_DEST}/${SCRIPT_NAME}"
-    _log_operation "symlink:${BIN_DEST}/${SCRIPT_NAME}"
-    echo_success "Symlink created: ${BIN_DEST}/${SCRIPT_NAME}"
-
-    # Validate symlink and target permissions
-    if [[ -L "${BIN_DEST}/${SCRIPT_NAME}" ]] || [[ -f "${BIN_DEST}/${SCRIPT_NAME}" ]]; then
-        if [[ ! -x "${LIB_DEST}/${PROJECT_NAME}.sh" ]]; then
-            echo_warning "Target script is not executable — attempting to fix."
-            chmod +x "${LIB_DEST}/${PROJECT_NAME}.sh" 2>/dev/null || true
-        fi
-    else
-        echo_warning "Symlink validation failed for ${BIN_DEST}/${SCRIPT_NAME}."
-    fi
-
-    # Warn if /usr/local/bin is not in PATH for the current user (non-root context)
     if [[ ":$PATH:" != *":${BIN_DEST}:"* ]]; then
         echo_warning "${BIN_DEST} is not in your PATH."
-        echo_warning "Add it to your PATH or use the full path: ${BIN_DEST}/${SCRIPT_NAME}"
+        echo_warning "Use the full path: ${BIN_DEST}/${SCRIPT_NAME}"
         echo_warning "For Bash, run: export PATH=\"\$PATH:${BIN_DEST}\""
-        echo_warning "To make permanent, add the above line to ~/.bashrc or ~/.profile."
     fi
-
-    _mark_step_done "scripts"
 }
 
-# Step 6: Install configuration file
+# Step 7: Install configuration file (never overwrites an existing one)
 install_config() {
-    if _is_step_done "config"; then
-        echo_success "Configuration already installed (idempotent)."
+    echo_info "Installing configuration file..."
+
+    # Migrate a config written by older installer versions under the old name
+    if [[ ! -f "$CONFIG_DEST" ]] && [[ -f "${CONFIG_DIR}/${LEGACY_CONFIG_NAME}" ]]; then
+        mv "${CONFIG_DIR}/${LEGACY_CONFIG_NAME}" "$CONFIG_DEST"
+        echo_warning "Migrated legacy config ${LEGACY_CONFIG_NAME} -> ${CONFIG_NAME}"
+    fi
+
+    if [[ -f "$CONFIG_DEST" ]]; then
+        echo_warning "Configuration file already exists; keeping existing version."
         return 0
     fi
 
-    echo_info "Installing configuration file..."
-
     if [[ -f "$CONFIG_SRC" ]]; then
-        # Don't overwrite existing config if it exists (user may have customized it)
-        if [[ ! -f "${CONFIG_DIR}/${PROJECT_NAME}.conf" ]]; then
-            install -m 600 "$CONFIG_SRC" "${CONFIG_DIR}/${PROJECT_NAME}.conf"
-            _log_operation "file:${CONFIG_DIR}/${PROJECT_NAME}.conf"
-            echo_success "Configuration file installed."
-        else
-            echo_warning "Configuration file already exists; keeping existing version."
-        fi
+        # Strip CR in case the file was checked out with Windows line endings
+        _install_text_file 600 "$CONFIG_SRC" "$CONFIG_DEST"
+        echo_success "Configuration file installed."
     else
         echo_warning "Config source not found: ${CONFIG_SRC}"
-        # Create a default config
-        cat > "${CONFIG_DIR}/${PROJECT_NAME}.conf" << 'CONFEOF'
+        ( umask 077; cat > "$CONFIG_DEST" << 'CONFEOF'
 # certbot-smart-manager configuration
 THRESHOLD_DAYS=30
 CRITICAL_THRESHOLD_DAYS=7
@@ -443,79 +495,100 @@ LOG_LEVEL="INFO"
 BACKUP_ENABLED=true
 BACKUP_DIR="/var/backups/certbot-smart-manager"
 BACKUP_RETENTION_DAYS=30
+BACKUP_ARCHIVE=false
 NOTIFICATION_METHOD="console"
 RELOAD_WEB_SERVER=true
 CONFEOF
-        chmod 600 "${CONFIG_DIR}/${PROJECT_NAME}.conf"
-        _log_operation "file:${CONFIG_DIR}/${PROJECT_NAME}.conf"
+        )
+        _log_operation "file:${CONFIG_DEST}"
         echo_success "Default configuration created."
     fi
-
-    _mark_step_done "config"
 }
 
-# Step 7: Set up permissions
+# Step 8: Set up permissions
 setup_permissions() {
-    if _is_step_done "permissions"; then
-        echo_success "Permissions already set (idempotent)."
-        return 0
-    fi
-
     echo_info "Setting up file permissions..."
 
     # Library files
     chown -R root:root "$LIB_DEST" 2>/dev/null || true
-    chmod -R 755 "$LIB_DEST" 2>/dev/null || true
+    chmod 755 "$LIB_DEST" "$MODULES_DEST" 2>/dev/null || true
+    chmod 755 "${LIB_DEST}/${PROJECT_NAME}.sh" 2>/dev/null || true
     chmod 640 "$MODULES_DEST"/*.sh 2>/dev/null || true
 
-    # Binary symlink
-    chown root:root "${BIN_DEST}/${SCRIPT_NAME}" 2>/dev/null || true
-    chmod 755 "${BIN_DEST}/${SCRIPT_NAME}" 2>/dev/null || true
-
-    # Config
+    # Config (contains SMTP password / tokens)
     chown -R root:root "$CONFIG_DIR" 2>/dev/null || true
-    chmod 755 "$CONFIG_DIR" 2>/dev/null || true
-    chmod 600 "${CONFIG_DIR}/${PROJECT_NAME}.conf" 2>/dev/null || true
+    chmod 750 "$CONFIG_DIR" 2>/dev/null || true
+    chmod 600 "$CONFIG_DEST" 2>/dev/null || true
 
     # Log file
-    touch "$LOG_FILE" 2>/dev/null || true
+    if [[ ! -e "$LOG_FILE" ]]; then
+        touch "$LOG_FILE"
+        _log_operation "file:${LOG_FILE}"
+    fi
     chown root:root "$LOG_FILE" 2>/dev/null || true
     chmod 640 "$LOG_FILE" 2>/dev/null || true
 
-    # Lock directory
-    chmod 755 "$(dirname "$LOCK_FILE")" 2>/dev/null || true
-
-    # Backup directory
-    chown -R root:root "$BACKUP_DIR" 2>/dev/null || true
+    # Backup directory (contains private keys)
+    chown root:root "$BACKUP_DIR" 2>/dev/null || true
     chmod 750 "$BACKUP_DIR" 2>/dev/null || true
 
-    _mark_step_done "permissions"
     echo_success "Permissions configured."
 }
 
-# Step 8: Install systemd service
-install_systemd_service() {
-    if _is_step_done "systemd-service"; then
-        echo_success "Systemd service already installed (idempotent)."
+# Remove units installed by older versions under the old name
+migrate_legacy_units() {
+    command_exists systemctl || return 0
+
+    local unit changed=false
+    for unit in "${LEGACY_UNIT_NAME}.timer" "${LEGACY_UNIT_NAME}.service"; do
+        if [[ -f "${SYSTEMD_DIR}/${unit}" ]]; then
+            systemctl disable --now "$unit" >/dev/null 2>&1 || true
+            rm -f "${SYSTEMD_DIR}/${unit}"
+            echo_warning "Removed legacy unit: ${unit}"
+            changed=true
+        fi
+    done
+
+    if [[ "$changed" == "true" ]]; then
+        systemctl daemon-reload 2>/dev/null || true
+    fi
+}
+
+# Step 9: Install systemd service + timer (always refreshed on upgrade)
+# Install the certbot deploy hook that reloads nginx/apache after EVERY
+# successful renewal — including renewals done by certbot's own timer
+# (certbot.timer / snap.certbot.renew.timer), which would otherwise leave
+# the web server serving the old certificate until it expires.
+install_deploy_hook() {
+    echo_info "Installing certbot deploy hook..."
+
+    if [[ ! -f "$HOOK_SRC" ]]; then
+        echo_warning "Deploy hook source not found: ${HOOK_SRC}; skipping."
         return 0
     fi
 
-    # Check if systemd is available
+    mkdir -p "$(dirname "$DEPLOY_HOOK_DEST")"
+    _install_text_file 755 "$HOOK_SRC" "$DEPLOY_HOOK_DEST"
+    echo_success "Deploy hook installed: ${DEPLOY_HOOK_DEST}"
+}
+
+install_systemd_units() {
     if ! command_exists systemctl; then
         echo_warning "systemd not available; skipping systemd installation."
         return 0
     fi
 
-    echo_info "Installing systemd service..."
+    migrate_legacy_units
+
+    echo_info "Installing systemd service and timer..."
 
     if [[ -f "$SERVICE_SRC" ]]; then
-        install -m 644 "$SERVICE_SRC" "${SYSTEMD_DIR}/${PROJECT_NAME}.service"
-        _log_operation "file:${SYSTEMD_DIR}/${PROJECT_NAME}.service"
-        echo_success "Systemd service installed."
+        _install_text_file 644 "$SERVICE_SRC" "${SYSTEMD_DIR}/${UNIT_NAME}.service"
+        echo_success "Systemd service installed: ${UNIT_NAME}.service"
     else
-        echo_warning "Service file not found: ${SERVICE_SRC}"
-        # Create a minimal service file
-        cat > "${SYSTEMD_DIR}/${PROJECT_NAME}.service" << SERVEOF
+        echo_warning "Service file not found: ${SERVICE_SRC}; creating a minimal one."
+        [[ -e "${SYSTEMD_DIR}/${UNIT_NAME}.service" ]] || _log_operation "file:${SYSTEMD_DIR}/${UNIT_NAME}.service"
+        cat > "${SYSTEMD_DIR}/${UNIT_NAME}.service" << SERVEOF
 [Unit]
 Description=Certbot Smart Manager - SSL Certificate Renewal Service
 After=network-online.target
@@ -526,146 +599,102 @@ Type=oneshot
 ExecStart=${BIN_DEST}/${SCRIPT_NAME} --auto
 User=root
 UMask=027
-StandardOutput=append:${LOG_FILE}
-StandardError=append:${LOG_FILE}
-Environment=CONFIG_FILE=${CONFIG_DIR}/${PROJECT_NAME}.conf
+Environment=CONFIG_FILE=${CONFIG_DEST}
 
 [Install]
 WantedBy=multi-user.target
 SERVEOF
-        chmod 644 "${SYSTEMD_DIR}/${PROJECT_NAME}.service"
-        _log_operation "file:${SYSTEMD_DIR}/${PROJECT_NAME}.service"
-        echo_warning "Minimal service file created."
+        chmod 644 "${SYSTEMD_DIR}/${UNIT_NAME}.service"
     fi
-
-    systemctl daemon-reload 2>/dev/null || true
-
-    _mark_step_done "systemd-service"
-}
-
-# Step 9: Install systemd timer
-install_systemd_timer() {
-    if _is_step_done "systemd-timer"; then
-        echo_success "Systemd timer already installed (idempotent)."
-        return 0
-    fi
-
-    if ! command_exists systemctl; then
-        echo_warning "systemd not available; skipping timer installation."
-        return 0
-    fi
-
-    echo_info "Installing systemd timer..."
 
     if [[ -f "$TIMER_SRC" ]]; then
-        install -m 644 "$TIMER_SRC" "${SYSTEMD_DIR}/${PROJECT_NAME}.timer"
-        _log_operation "file:${SYSTEMD_DIR}/${PROJECT_NAME}.timer"
-        echo_success "Systemd timer installed."
+        _install_text_file 644 "$TIMER_SRC" "${SYSTEMD_DIR}/${UNIT_NAME}.timer"
+        echo_success "Systemd timer installed: ${UNIT_NAME}.timer"
     else
-        echo_warning "Timer file not found: ${TIMER_SRC}"
-        # Create a minimal timer file
-        cat > "${SYSTEMD_DIR}/${PROJECT_NAME}.timer" << TIMEREOF
+        echo_warning "Timer file not found: ${TIMER_SRC}; creating a minimal one."
+        [[ -e "${SYSTEMD_DIR}/${UNIT_NAME}.timer" ]] || _log_operation "file:${SYSTEMD_DIR}/${UNIT_NAME}.timer"
+        cat > "${SYSTEMD_DIR}/${UNIT_NAME}.timer" << TIMEREOF
 [Unit]
 Description=Certbot Smart Manager - Twice Daily Timer
-Requires=${PROJECT_NAME}.service
 
 [Timer]
 OnCalendar=*-*-* 03:00:00
 OnCalendar=*-*-* 15:00:00
+Unit=${UNIT_NAME}.service
 Persistent=true
 RandomizedDelaySec=300
 
 [Install]
 WantedBy=timers.target
 TIMEREOF
-        chmod 644 "${SYSTEMD_DIR}/${PROJECT_NAME}.timer"
-        _log_operation "file:${SYSTEMD_DIR}/${PROJECT_NAME}.timer"
-        echo_warning "Minimal timer file created."
+        chmod 644 "${SYSTEMD_DIR}/${UNIT_NAME}.timer"
     fi
 
     systemctl daemon-reload 2>/dev/null || true
-
-    _mark_step_done "systemd-timer"
 }
 
-# Step 10: Enable and start systemd timer
+# Step 10: Enable and start systemd timer (idempotent, always runs)
 enable_systemd_timer() {
-    if _is_step_done "systemd-enabled"; then
-        echo_success "Systemd timer already enabled (idempotent)."
-        return 0
-    fi
-
-    if ! command_exists systemctl; then
-        return 0
-    fi
+    command_exists systemctl || return 0
 
     echo_info "Enabling and starting systemd timer..."
 
-    systemctl enable "${PROJECT_NAME}.timer" 2>/dev/null && {
-        _log_operation "systemd_enable:${PROJECT_NAME}.timer"
-        echo_success "Timer enabled: ${PROJECT_NAME}.timer"
-    } || {
-        echo_warning "Failed to enable timer."
-    }
+    local was_enabled=false
+    systemctl is-enabled --quiet "${UNIT_NAME}.timer" 2>/dev/null && was_enabled=true
 
-    systemctl start "${PROJECT_NAME}.timer" 2>/dev/null && {
-        _log_operation "systemd_start:${PROJECT_NAME}.timer"
-        echo_success "Timer started."
-    } || {
-        echo_warning "Failed to start timer."
-    }
-
-    _mark_step_done "systemd-enabled"
+    if systemctl enable --now "${UNIT_NAME}.timer" >/dev/null 2>&1; then
+        if [[ "$was_enabled" == "false" ]]; then
+            _log_operation "systemd_enable:${UNIT_NAME}.timer"
+            _log_operation "systemd_start:${UNIT_NAME}.timer"
+        fi
+        echo_success "Timer enabled and started: ${UNIT_NAME}.timer"
+    else
+        echo_warning "Failed to enable/start timer ${UNIT_NAME}.timer."
+    fi
 }
 
-# Step 11: Create cron fallback (if systemd not available)
+# Step 11: Create cron fallback (only if the systemd timer is not active)
 install_cron_fallback() {
-    if _is_step_done "cron"; then
-        echo_success "Cron already configured (idempotent)."
+    if command_exists systemctl && systemctl is-active --quiet "${UNIT_NAME}.timer" 2>/dev/null; then
+        echo_success "Systemd timer active; cron fallback not needed."
         return 0
     fi
 
-    # Only install cron if systemd timer is not available
-    if command_exists systemctl && systemctl list-units --type=timer 2>/dev/null | grep -q "${PROJECT_NAME}.timer"; then
-        echo_success "Systemd timer active; cron fallback not needed."
-        _mark_step_done "cron"
+    if ! command_exists crontab; then
+        echo_warning "Neither an active systemd timer nor crontab is available."
+        echo_warning "Schedule '${BIN_DEST}/${SCRIPT_NAME} --auto' manually."
         return 0
     fi
 
     echo_info "Creating cron fallback..."
 
-    local cron_line="0 3,15 * * * ${BIN_DEST}/${SCRIPT_NAME} --auto >> ${LOG_FILE} 2>&1"
+    # The script writes its own log file; discard stdout/stderr so cron
+    # does not duplicate every line into the log (or mail it).
+    local cron_line="0 3,15 * * * ${BIN_DEST}/${SCRIPT_NAME} --auto >/dev/null 2>&1"
 
-    # Check if cron entry already exists
     if crontab -l 2>/dev/null | grep -qF "${SCRIPT_NAME} --auto"; then
         echo_success "Cron entry already exists."
+    elif { crontab -l 2>/dev/null || true; echo "$cron_line"; } | crontab - 2>/dev/null; then
+        echo_success "Cron entry added."
+        _log_operation "cron:added"
     else
-        (crontab -l 2>/dev/null || true; echo "$cron_line") | crontab - 2>/dev/null && {
-            echo_success "Cron entry added."
-            _log_operation "cron:added"
-        } || {
-            echo_warning "Failed to add cron entry."
-        }
+        echo_warning "Failed to add cron entry."
     fi
-
-    _mark_step_done "cron"
 }
 
-# Step 12: Verify installation
+# Step 12: Verify installation (non-fatal)
 verify_installation() {
     echo_info "Verifying installation..."
 
     local errors=0
 
-    # Check main script exists
-    if [[ -f "${LIB_DEST}/${PROJECT_NAME}.sh" ]]; then
+    if [[ -x "${LIB_DEST}/${PROJECT_NAME}.sh" ]]; then
         echo_success "Main script: ${LIB_DEST}/${PROJECT_NAME}.sh"
     else
-        echo_error "Main script missing!"
+        echo_error "Main script missing or not executable!"
         errors=$((errors + 1))
     fi
 
-    # Check symlink
     if [[ -L "${BIN_DEST}/${SCRIPT_NAME}" ]] || [[ -f "${BIN_DEST}/${SCRIPT_NAME}" ]]; then
         echo_success "Executable: ${BIN_DEST}/${SCRIPT_NAME}"
     else
@@ -673,49 +702,50 @@ verify_installation() {
         errors=$((errors + 1))
     fi
 
-    # Check config
-    if [[ -f "${CONFIG_DIR}/${PROJECT_NAME}.conf" ]]; then
-        echo_success "Config: ${CONFIG_DIR}/${PROJECT_NAME}.conf"
+    if [[ -f "$CONFIG_DEST" ]]; then
+        echo_success "Config: ${CONFIG_DEST}"
     else
         echo_error "Config file missing!"
         errors=$((errors + 1))
     fi
 
-    # Check log file
     if [[ -f "$LOG_FILE" ]]; then
         echo_success "Log: ${LOG_FILE}"
     else
         echo_warning "Log file not yet created (will be created on first run)."
     fi
 
-    # Check modules
     local module_count
-    module_count="$(ls -1 "$MODULES_DEST"/*.sh 2>/dev/null | wc -l)"
+    module_count="$(find "$MODULES_DEST" -maxdepth 1 -name '*.sh' 2>/dev/null | wc -l)"
     if [[ $module_count -gt 0 ]]; then
         echo_success "Modules: ${module_count} installed"
     else
-        echo_warning "No modules found."
+        echo_error "No modules found."
+        errors=$((errors + 1))
     fi
 
-    # Check systemd
     if command_exists systemctl; then
-        if [[ -f "${SYSTEMD_DIR}/${PROJECT_NAME}.service" ]]; then
-            echo_success "Systemd service: ${PROJECT_NAME}.service"
+        if [[ -f "${SYSTEMD_DIR}/${UNIT_NAME}.service" ]]; then
+            echo_success "Systemd service: ${UNIT_NAME}.service"
         else
             echo_warning "Systemd service not installed."
         fi
-        if [[ -f "${SYSTEMD_DIR}/${PROJECT_NAME}.timer" ]]; then
-            echo_success "Systemd timer: ${PROJECT_NAME}.timer"
+        if [[ -f "${SYSTEMD_DIR}/${UNIT_NAME}.timer" ]]; then
+            echo_success "Systemd timer: ${UNIT_NAME}.timer"
         else
             echo_warning "Systemd timer not installed."
         fi
     fi
 
-    # Test executable
-    if "${BIN_DEST}/${SCRIPT_NAME}" --version 2>/dev/null; then
-        echo_success "Executable works."
+    if ! command_exists certbot; then
+        echo_warning "certbot is not installed — renewals will fail until it is."
+    fi
+
+    if "${BIN_DEST}/${SCRIPT_NAME}" --version >/dev/null 2>&1; then
+        echo_success "Executable works ($("${BIN_DEST}/${SCRIPT_NAME}" --version 2>/dev/null))."
     else
-        echo_warning "Executable test failed (may require sudo)."
+        echo_warning "Executable test failed."
+        errors=$((errors + 1))
     fi
 
     return $errors
@@ -728,6 +758,8 @@ verify_installation() {
 rollback_install() {
     local error_msg="${1:-Installation failed}"
 
+    trap - ERR INT TERM
+
     echo_warning ""
     echo_warning "=========================================="
     echo_warning "  ROLLING BACK INSTALLATION"
@@ -735,45 +767,42 @@ rollback_install() {
     echo_warning ""
     echo_warning "Reason: ${error_msg}"
 
-    if [[ ! -f "$INSTALL_LOG" ]]; then
-        echo_warning "No install log found; performing best-effort cleanup."
-    else
-        # Reverse operations
+    # Only operations that created something NEW are logged, so a failed
+    # upgrade does not remove a previously working installation.
+    if [[ -n "$INSTALL_LOG" ]] && [[ -f "$INSTALL_LOG" ]]; then
         local operations=()
+        local line
         while IFS= read -r line; do
             operations+=("$line")
         done < "$INSTALL_LOG"
 
-        local i
+        local i op
         for (( i=${#operations[@]}-1; i>=0; i-- )); do
-            local op="${operations[$i]}"
+            op="${operations[$i]}"
             case "$op" in
                 file:*)
-                    local f="${op#file:}"
-                    rm -f "$f" 2>/dev/null || true
+                    rm -f "${op#file:}" 2>/dev/null || true
                     ;;
                 symlink:*)
-                    local s="${op#symlink:}"
-                    rm -f "$s" 2>/dev/null || true
+                    rm -f "${op#symlink:}" 2>/dev/null || true
                     ;;
                 dir:*)
-                    local d="${op#dir:}"
-                    rmdir "$d" 2>/dev/null || true
+                    rm -rf "${op#dir:}/.install-state" 2>/dev/null || true
+                    rmdir "${op#dir:}" 2>/dev/null || true
                     ;;
                 systemd_enable:*)
-                    local u="${op#systemd_enable:}"
-                    systemctl disable "$u" 2>/dev/null || true
+                    systemctl disable "${op#systemd_enable:}" 2>/dev/null || true
                     ;;
                 systemd_start:*)
-                    local u="${op#systemd_start:}"
-                    systemctl stop "$u" 2>/dev/null || true
+                    systemctl stop "${op#systemd_start:}" 2>/dev/null || true
+                    ;;
+                cron:added)
+                    { crontab -l 2>/dev/null || true; } | grep -vF "${SCRIPT_NAME} --auto" | crontab - 2>/dev/null || true
                     ;;
             esac
         done
+        command_exists systemctl && systemctl daemon-reload 2>/dev/null || true
     fi
-
-    # Remove marker directory
-    rm -rf "$INSTALL_MARKER_DIR" 2>/dev/null || true
 
     echo_error ""
     echo_error "=========================================="
@@ -797,23 +826,17 @@ rollback_install() {
 show_summary() {
     echo ""
     echo_bold "========================================"
-    echo_bold "  ${PROJECT_NAME} v${VERSION}"
+    echo_bold "  ${PROJECT_NAME} v${INSTALLER_VERSION}"
     echo_bold "  Installation Complete!"
     echo_bold "========================================"
     echo ""
     echo_info "Installation paths:"
     echo "  Executable:  ${BIN_DEST}/${SCRIPT_NAME}"
     echo "  Library:     ${LIB_DEST}/"
-    echo "  Config:      ${CONFIG_DIR}/${PROJECT_NAME}.conf"
+    echo "  Config:      ${CONFIG_DEST}"
     echo "  Log:         ${LOG_FILE}"
     echo "  Backup:      ${BACKUP_DIR}/"
     echo ""
-
-    if command_exists systemctl; then
-        echo_info "Systemd timer status:"
-        systemctl status "${PROJECT_NAME}.timer" 2>/dev/null | head -n 5 || true
-        echo ""
-    fi
 
     echo_bold "Commands:"
     echo "  ssl-manager                 Interactive menu"
@@ -827,36 +850,58 @@ show_summary() {
     echo "  ssl-manager --backup        Backup /etc/letsencrypt/"
     echo "  ssl-manager --help          Show help"
     echo ""
-    echo_bold "Systemd:"
-    echo "  sudo systemctl status ${PROJECT_NAME}.timer"
-    echo "  sudo systemctl status ${PROJECT_NAME}.service"
-    echo "  sudo journalctl -u ${PROJECT_NAME}.service"
-    echo ""
+
+    if command_exists systemctl; then
+        echo_bold "Systemd:"
+        echo "  sudo systemctl status ${UNIT_NAME}.timer"
+        echo "  sudo systemctl status ${UNIT_NAME}.service"
+        echo "  sudo journalctl -u ${UNIT_NAME}.service"
+        echo ""
+    fi
+
     echo_bold "Logs:"
-    echo "  tail -f ${LOG_FILE}"
+    echo "  sudo tail -f ${LOG_FILE}"
     echo ""
 
     if command_exists systemctl; then
-        if systemctl is-active --quiet "${PROJECT_NAME}.timer" 2>/dev/null; then
+        if systemctl is-active --quiet "${UNIT_NAME}.timer" 2>/dev/null; then
             echo_success "Timer is running. Certificates will be checked twice daily."
+            echo ""
+            echo_bold "Next scheduled runs:"
+            systemctl list-timers "${UNIT_NAME}.timer" --no-pager 2>/dev/null | tail -n +2 || true
         else
             echo_warning "Timer is not running. Enable with:"
-            echo "  sudo systemctl enable --now ${PROJECT_NAME}.timer"
+            echo "  sudo systemctl enable --now ${UNIT_NAME}.timer"
         fi
     fi
 
     echo ""
-    echo_bold "Next scheduled runs:"
-    if command_exists systemctl; then
-        systemctl list-timers "${PROJECT_NAME}.timer" 2>/dev/null | tail -n +2 || echo "  (check with: systemctl list-timers)"
+    echo_bold "Next steps:"
+    echo "  1. Request a certificate for each new domain (one time per domain):"
+    echo "       sudo ssl-manager --install"
+    echo "     Existing certificates in /etc/letsencrypt are picked up automatically."
+    echo "  2. Set up notifications so you hear about failures / manual renewals:"
+    echo "       sudo ssl-manager --configure"
+    echo "  3. Verify unattended renewal works:"
+    echo "       sudo ssl-manager --dry-run"
+    echo ""
+    echo "  After that, renewal is automatic. Only certificates issued with manual"
+    echo "  DNS validation need you: you get a reminder, then run"
+    echo "       sudo ssl-manager --renew-cert <name>"
+
+    local method
+    method="$(sed -n "s/^[[:space:]]*NOTIFICATION_METHOD=[\"']\{0,1\}\([a-z]*\).*/\1/p" "$CONFIG_DEST" 2>/dev/null | head -n 1)"
+    if [[ -z "$method" || "$method" == "console" || "$method" == "log" ]]; then
+        echo ""
+        echo_warning "Notifications are '${method:-console}' only (wall/log). On a server where nobody is"
+        echo_warning "logged in, a failed renewal would go unnoticed. Run: sudo ssl-manager --configure"
     fi
 
     echo ""
     echo_success "Installation complete!"
     echo ""
 
-    # Log installation
-    echo "[$(date '+%Y-%m-%d %H:%M:%S')] INFO: Installation completed successfully" >> "$LOG_FILE" 2>/dev/null || true
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] INFO: Installation completed successfully (installer v${INSTALLER_VERSION})" >> "$LOG_FILE" 2>/dev/null || true
 }
 
 # =============================================================================
@@ -866,20 +911,23 @@ show_summary() {
 main() {
     echo_bold ""
     echo_bold "========================================"
-    echo_bold "  ${PROJECT_NAME} v${VERSION}"
+    echo_bold "  ${PROJECT_NAME} v${INSTALLER_VERSION}"
     echo_bold "  One-Click Installer"
     echo_bold "========================================"
     echo ""
 
     # Trap errors for rollback
-    trap 'rollback_install "Unexpected error during installation."' ERR INT TERM
+    trap 'rollback_install "Unexpected error during installation (line ${LINENO})."' ERR
+    trap 'rollback_install "Installation interrupted."' INT TERM
 
-    # Step-by-step installation
     detect_os
     get_package_manager
     echo ""
 
     install_dependencies
+    echo ""
+
+    ensure_sources
     echo ""
 
     install_certbot
@@ -900,10 +948,10 @@ main() {
     setup_permissions
     echo ""
 
-    install_systemd_service
+    install_deploy_hook
     echo ""
 
-    install_systemd_timer
+    install_systemd_units
     echo ""
 
     enable_systemd_timer
@@ -915,16 +963,15 @@ main() {
     # Remove error trap for verification (non-fatal)
     trap - ERR INT TERM
 
-    verify_installation
+    if ! verify_installation; then
+        echo_warning "Verification reported problems — see messages above."
+    fi
     echo ""
 
     show_summary
-
-    # Clean up install log
-    rm -f "$INSTALL_LOG" 2>/dev/null || true
 }
 
 # =============================================================================
 # RUN
 # =============================================================================
-main
+main "$@"

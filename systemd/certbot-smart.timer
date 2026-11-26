@@ -1,12 +1,15 @@
 [Unit]
 Description=Certbot Smart Manager - Twice Daily SSL Renewal Timer
 Documentation=https://github.com/shuvo-halder/certbot-smart-manager
-Requires=certbot-smart.service
+# No Requires=certbot-smart.service here: that would start the service
+# (i.e. run a renewal) every time the timer itself is started. A timer
+# activates the service with the same name automatically.
 
 [Timer]
 # Run at 03:00 and 15:00 daily
 OnCalendar=*-*-* 03:00:00
 OnCalendar=*-*-* 15:00:00
+Unit=certbot-smart.service
 
 # Handle missed runs (e.g., system was off)
 Persistent=true

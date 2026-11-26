@@ -39,8 +39,9 @@ _log() {
     local message="$*"
     local log_file="${LOG_FILE:-/var/log/certbot-smart-manager.log}"
 
-    # Always write to log file
-    printf '[%s] %s: %s\n' "$timestamp" "$level" "$message" >> "$log_file"
+    # Always try to write to the log file. A non-writable log (e.g. running
+    # as a normal user) must never abort the script under `set -e`.
+    { printf '[%s] %s: %s\n' "$timestamp" "$level" "$message" >> "$log_file"; } 2>/dev/null || true
 
     # Also output to stderr for errors, stdout for others
     if [[ "$level" == "ERROR" ]]; then
@@ -85,7 +86,10 @@ require_root() {
 # =============================================================================
 
 # Acquire a lock file using flock to prevent duplicate execution
-# Returns 0 if lock acquired, 1 if already locked
+# Returns 0 if lock acquired, 1 if already locked.
+# NOTE: cleanup on exit (lock release, firewall ports) is handled by the
+# single EXIT trap installed in the main script; this function does not
+# override it.
 acquire_lock() {
     local lock_file="${LOCK_FILE:-/var/lock/certbot-smart-manager.lock}"
     local lock_dir
@@ -108,31 +112,36 @@ acquire_lock() {
             rm -f "$lock_file"
         fi
         echo "$$" > "$lock_file"
-        # Register cleanup trap
-        trap 'release_lock' EXIT INT TERM
+        LOCK_HELD=true
         return 0
     fi
 
     # Use flock
     exec 9>"$lock_file"
     if ! flock -n 9; then
+        exec 9>&-
         log_warning "Another renewal job is already running (lock: ${lock_file})"
         return 1
     fi
+    LOCK_HELD=true
     log_debug "Lock acquired: ${lock_file}"
-
-    # Register cleanup for flock-based lock
-    trap 'release_lock' EXIT INT TERM
     return 0
 }
 
-# Release the lock
+# Release the lock (safe to call multiple times, or when no lock is held)
 release_lock() {
     local lock_file="${LOCK_FILE:-/var/lock/certbot-smart-manager.lock}"
 
-    # If using flock, close fd 9
+    if [[ "${LOCK_HELD:-false}" != "true" ]]; then
+        return 0
+    fi
+    LOCK_HELD=false
+
+    # If using flock, close fd 9.
+    # (Do NOT write `exec 9>&- 2>/dev/null` — with `exec` that would redirect
+    # the shell's stderr to /dev/null permanently.)
     if command -v flock >/dev/null 2>&1; then
-        exec 9>&- 2>/dev/null || true
+        exec 9>&-
     fi
 
     # Clean up PID file if it was our fallback
@@ -178,6 +187,20 @@ validate_positive_int() {
     return 0
 }
 
+# Trim leading/trailing whitespace (pure bash; unlike `xargs` it does not
+# choke on quotes or backslashes in user input)
+trim() {
+    local s="$*"
+    s="${s#"${s%%[![:space:]]*}"}"
+    s="${s%"${s##*[![:space:]]}"}"
+    printf '%s' "$s"
+}
+
+# Lowercase a string
+to_lower() {
+    printf '%s' "$*" | tr '[:upper:]' '[:lower:]'
+}
+
 # Sanitize a filename (remove dangerous characters)
 sanitize_filename() {
     local name="$1"
@@ -194,12 +217,25 @@ command_exists() {
     command -v "$1" >/dev/null 2>&1
 }
 
+# Read a single field from /etc/os-release WITHOUT sourcing it into the
+# current shell. Sourcing it directly would overwrite our own globals such
+# as VERSION and NAME (os-release defines both).
+# Usage: os_release_field ID
+os_release_field() {
+    local field="$1"
+    [[ -r /etc/os-release ]] || { printf 'unknown'; return 0; }
+    (
+        # shellcheck disable=SC1091
+        . /etc/os-release
+        printf '%s' "${!field:-unknown}"
+    )
+}
+
 # Get OS ID (ubuntu, debian, centos, rhel, rocky, almalinux, fedora)
 get_os_id() {
     if [[ -r /etc/os-release ]]; then
-        # shellcheck disable=SC1091
-        source /etc/os-release
-        printf '%s\n' "${ID:-unknown}" | tr '[:upper:]' '[:lower:]'
+        os_release_field ID | tr '[:upper:]' '[:lower:]'
+        printf '\n'
     elif [[ -r /etc/redhat-release ]]; then
         if grep -qi "centos" /etc/redhat-release 2>/dev/null; then
             printf 'centos\n'

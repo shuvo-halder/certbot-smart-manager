@@ -115,10 +115,34 @@ notify_console() {
 }
 
 # =============================================================================
+# HELPERS
+# =============================================================================
+
+# Escape a string for use inside a double-quoted value of a curl config file
+_curl_cfg_escape() {
+    local s="$1"
+    s="${s//\\/\\\\}"
+    s="${s//\"/\\\"}"
+    printf '%s' "$s"
+}
+
+# Escape a string for use inside a JSON string literal
+_json_escape() {
+    local s="$1"
+    s="${s//\\/\\\\}"
+    s="${s//\"/\\\"}"
+    s="${s//$'\n'/\\n}"
+    s="${s//$'\r'/\\r}"
+    s="${s//$'\t'/\\t}"
+    printf '%s' "$s"
+}
+
+# =============================================================================
 # EMAIL NOTIFICATION (SMTP)
 # =============================================================================
 
-# Send email notification using available tools (sendmail, mail, or curl to SMTP)
+# Send email notification: direct SMTP via curl if SMTP_SERVER is set,
+# otherwise the system `mail` / `sendmail` commands.
 notify_email() {
     local message="$1"
     local subject="${2:-SSL Certificate Alert - certbot-smart-manager}"
@@ -127,73 +151,83 @@ notify_email() {
     local smtp_from="${SMTP_FROM:-}"
     local smtp_to="${SMTP_TO:-}"
 
-    # If SMTP is not configured, try system mail command
-    if [[ -z "$smtp_server" ]] || [[ -z "$smtp_to" ]]; then
-        log_debug "SMTP not configured; trying system mail command"
+    if [[ -z "$smtp_to" ]]; then
+        log_warning "Email notification skipped: SMTP_TO (recipient) is not configured"
+        return 1
+    fi
+
+    # No SMTP server configured — use the local MTA
+    if [[ -z "$smtp_server" ]]; then
+        log_debug "SMTP_SERVER not configured; trying system mail command"
 
         if command -v mail >/dev/null 2>&1; then
-            printf '%s\n' "$message" | mail -s "$subject" "$smtp_to" 2>/dev/null && {
+            if printf '%s\n' "$message" | mail -s "$subject" "$smtp_to" 2>/dev/null; then
                 log_debug "Email sent via 'mail' command to ${smtp_to}"
                 return 0
-            } || {
-                log_warning "Failed to send email via 'mail' command"
-                return 1
-            }
+            fi
+            log_warning "Failed to send email via 'mail' command"
+            return 1
         elif command -v sendmail >/dev/null 2>&1; then
-            {
+            if {
                 printf 'Subject: %s\n' "$subject"
                 printf 'To: %s\n' "$smtp_to"
-                printf 'From: %s\n' "${smtp_from:-root@$(hostname -f)}"
+                printf 'From: %s\n' "${smtp_from:-root@$(hostname -f 2>/dev/null || hostname)}"
                 printf 'Content-Type: text/plain; charset=UTF-8\n\n'
                 printf '%s\n' "$message"
-            } | sendmail -t 2>/dev/null && {
+            } | sendmail -t 2>/dev/null; then
                 log_debug "Email sent via sendmail to ${smtp_to}"
                 return 0
-            } || {
-                log_warning "Failed to send email via sendmail"
-                return 1
-            }
+            fi
+            log_warning "Failed to send email via sendmail"
+            return 1
         else
-            log_warning "No email delivery method available (install 'mailutils' or 'sendmail')"
+            log_warning "No email delivery method available (set SMTP_SERVER, or install 'mailutils' / 'sendmail')"
             return 1
         fi
     fi
 
-    # SMTP via curl if configured
-    if command -v curl >/dev/null 2>&1; then
-        local smtp_port="${SMTP_PORT:-587}"
-        local smtp_user="${SMTP_USER:-}"
-        local smtp_pass="${SMTP_PASS:-}"
-        local smtp_use_tls="${SMTP_USE_TLS:-true}"
-
-        local curl_smtp_args=()
-        curl_smtp_args+=("smtp://${smtp_server}:${smtp_port}")
-        if [[ "$smtp_use_tls" == "true" ]]; then
-            curl_smtp_args+=("--ssl-reqd")
-        fi
-        if [[ -n "$smtp_user" ]] && [[ -n "$smtp_pass" ]]; then
-            curl_smtp_args+=("--user" "${smtp_user}:${smtp_pass}")
-        fi
-        curl_smtp_args+=("--mail-from" "${smtp_from:-${smtp_user}}")
-        curl_smtp_args+=("--mail-rcpt" "$smtp_to")
-
-        {
-            printf 'From: %s\n' "${smtp_from:-${smtp_user}}"
-            printf 'To: %s\n' "$smtp_to"
-            printf 'Subject: %s\n' "$subject"
-            printf 'Content-Type: text/plain; charset=UTF-8\n\n'
-            printf '%s\n' "$message"
-        } | curl "${curl_smtp_args[@]}" --upload-file - 2>/dev/null && {
-            log_debug "Email sent via SMTP (${smtp_server}) to ${smtp_to}"
-            return 0
-        } || {
-            log_warning "Failed to send email via SMTP (${smtp_server})"
-            return 1
-        }
-    else
+    if ! command -v curl >/dev/null 2>&1; then
         log_warning "curl not available for SMTP delivery"
         return 1
     fi
+
+    local smtp_port="${SMTP_PORT:-587}"
+    local smtp_user="${SMTP_USER:-}"
+    local smtp_pass="${SMTP_PASS:-}"
+    local smtp_use_tls="${SMTP_USE_TLS:-true}"
+    local mail_from="${smtp_from:-${smtp_user}}"
+
+    # Port 465 = implicit TLS (smtps://); otherwise STARTTLS via --ssl-reqd
+    local scheme="smtp"
+    [[ "$smtp_port" == "465" ]] && scheme="smtps"
+
+    local curl_args=(--silent --show-error --fail --url "${scheme}://${smtp_server}:${smtp_port}")
+    if [[ "$smtp_use_tls" == "true" ]]; then
+        curl_args+=(--ssl-reqd)
+    fi
+    curl_args+=(--mail-from "$mail_from" --mail-rcpt "$smtp_to" --upload-file -)
+
+    # Credentials are passed through a curl config on a file descriptor, so
+    # the SMTP password never appears in the process list (ps aux).
+    local cred_cfg=""
+    if [[ -n "$smtp_user" ]] && [[ -n "$smtp_pass" ]]; then
+        cred_cfg="user = \"$(_curl_cfg_escape "${smtp_user}:${smtp_pass}")\""
+    fi
+
+    if {
+        printf 'From: %s\r\n' "$mail_from"
+        printf 'To: %s\r\n' "$smtp_to"
+        printf 'Subject: %s\r\n' "$subject"
+        printf 'Date: %s\r\n' "$(LC_ALL=C date -R)"
+        printf 'Content-Type: text/plain; charset=UTF-8\r\n\r\n'
+        printf '%s\r\n' "$message"
+    } | curl --config <(printf '%s\n' "$cred_cfg") "${curl_args[@]}" >/dev/null 2>&1; then
+        log_debug "Email sent via SMTP (${smtp_server}) to ${smtp_to}"
+        return 0
+    fi
+
+    log_warning "Failed to send email via SMTP (${smtp_server}:${smtp_port})"
+    return 1
 }
 
 # =============================================================================
@@ -217,21 +251,22 @@ notify_telegram() {
         return 1
     fi
 
+    # The URL contains the bot token, so pass it via a curl config (not argv).
+    # --data-urlencode makes '&', '+', '=' etc. in the message safe; no
+    # parse_mode, so '<' and '>' in the text cannot break the request.
+    # --fail makes HTTP errors (e.g. 401 bad token) count as failures.
     local api_url="https://api.telegram.org/bot${bot_token}/sendMessage"
-    local payload
-    payload="$(printf '%s' "$message" | jq -Rs . 2>/dev/null || printf '"%s"' "$message")"
-
-    curl -s -X POST "$api_url" \
-        -d "chat_id=${chat_id}" \
-        -d "text=${message}" \
-        -d "parse_mode=HTML" \
-        -o /dev/null 2>/dev/null && {
+    if curl --config <(printf 'url = "%s"\n' "$(_curl_cfg_escape "$api_url")") \
+        --silent --show-error --fail -X POST \
+        --data-urlencode "chat_id=${chat_id}" \
+        --data-urlencode "text=${message}" \
+        -o /dev/null 2>/dev/null; then
         log_debug "Telegram notification sent to chat ${chat_id}"
         return 0
-    } || {
-        log_warning "Failed to send Telegram notification"
-        return 1
-    }
+    fi
+
+    log_warning "Failed to send Telegram notification"
+    return 1
 }
 
 # =============================================================================
@@ -254,23 +289,21 @@ notify_slack() {
         return 1
     fi
 
-    # Escape message for JSON
-    local escaped_message
-    escaped_message="$(printf '%s' "$message" | sed 's/"/\\"/g' | sed ':a;N;$!ba;s/\n/\\n/g')"
-
     local payload
-    payload="{\"text\":\"${escaped_message}\",\"mrkdwn\":true}"
+    payload="{\"text\":\"$(_json_escape "$message")\",\"mrkdwn\":true}"
 
-    curl -s -X POST "$webhook_url" \
+    # The webhook URL is a secret, so pass it via a curl config (not argv)
+    if curl --config <(printf 'url = "%s"\n' "$(_curl_cfg_escape "$webhook_url")") \
+        --silent --show-error --fail -X POST \
         -H "Content-Type: application/json" \
-        -d "$payload" \
-        -o /dev/null 2>/dev/null && {
+        --data-binary "$payload" \
+        -o /dev/null 2>/dev/null; then
         log_debug "Slack notification sent"
         return 0
-    } || {
-        log_warning "Failed to send Slack notification"
-        return 1
-    }
+    fi
+
+    log_warning "Failed to send Slack notification"
+    return 1
 }
 
 # =============================================================================
@@ -395,8 +428,9 @@ configure_notifications_interactive() {
     echo "  6) Log only"
     echo ""
 
-    printf "Enter choice [1-6] (current: ${NOTIFICATION_METHOD:-console}): "
-    read -r choice
+    local choice smtp_port_input test_choice
+    printf 'Enter choice [1-6] (current: %s): ' "${NOTIFICATION_METHOD:-console}"
+    read -r choice || choice=""
 
     case "${choice:-0}" in
         1) NOTIFICATION_METHOD="console" ;;
@@ -483,6 +517,7 @@ configure_notifications_interactive() {
     _update_config_value "$config_file" "SMTP_SERVER" "${SMTP_SERVER:-}"
     _update_config_value "$config_file" "SMTP_PORT" "${SMTP_PORT:-587}"
     _update_config_value "$config_file" "SMTP_USER" "${SMTP_USER:-}"
+    _update_config_value "$config_file" "SMTP_PASS" "${SMTP_PASS:-}"
     _update_config_value "$config_file" "SMTP_FROM" "${SMTP_FROM:-}"
     _update_config_value "$config_file" "SMTP_TO" "${SMTP_TO:-}"
     _update_config_value "$config_file" "TELEGRAM_BOT_TOKEN" "${TELEGRAM_BOT_TOKEN:-}"
@@ -495,8 +530,8 @@ configure_notifications_interactive() {
     echo ""
     echo_info "Send a test notification? [Y/n]"
     printf "> "
-    read -r test_choice
-    test_choice="$(printf '%s' "$test_choice" | tr '[:upper:]' '[:lower:]' | xargs)"
+    read -r test_choice || test_choice="n"
+    test_choice="$(to_lower "$(trim "$test_choice")")"
 
     if [[ "$test_choice" != "n" ]] && [[ "$test_choice" != "no" ]]; then
         echo_info "Sending test notification..."
@@ -505,30 +540,61 @@ configure_notifications_interactive() {
     fi
 }
 
-# Update a single configuration value in the config file
+# Update a single configuration value in the config file.
+#
+# The value is written single-quoted (KEY='value'), so it is stored
+# literally when the config is sourced: '$', '`', '"', '\' and '/' are all
+# safe. (The previous sed-based version broke on any value containing '/',
+# e.g. every Slack webhook URL, and allowed shell injection via '$(...)'.)
 _update_config_value() {
     local file="$1"
     local key="$2"
     local value="$3"
 
-    if [[ ! -f "$file" ]]; then
-        mkdir -p "$(dirname "$file")"
-        touch "$file"
+    if [[ ! "$key" =~ ^[A-Z_][A-Z0-9_]*$ ]]; then
+        log_error "Refusing to write invalid config key: ${key}"
+        return 1
     fi
 
-    if grep -qE "^(# )?${key}=" "$file" 2>/dev/null; then
-        # Update existing line (comment or uncommented)
-        if grep -qE "^${key}=" "$file" 2>/dev/null; then
-            # Line exists and is uncommented — update in place
-            sed -i "s/^${key}=.*/${key}=\"${value}\"/" "$file"
-        else
-            # Line is commented — uncomment and update
-            sed -i "s/^# ${key}=.*/${key}=\"${value}\"/" "$file"
-        fi
-    else
-        # Append new line
-        printf '\n%s="%s"\n' "$key" "$value" >> "$file"
+    if [[ ! -f "$file" ]]; then
+        mkdir -p "$(dirname "$file")"
+        ( umask 077; : > "$file" )
     fi
+
+    # Quote for the shell: ' -> '\''
+    local quoted="'${value//\'/\'\\\'\'}'"
+    local new_line="${key}=${quoted}"
+
+    local tmp
+    tmp="$(mktemp "${file}.XXXXXX")" || {
+        log_error "Unable to create temporary file next to ${file}"
+        return 1
+    }
+    chmod 600 "$tmp" 2>/dev/null || true
+
+    # Replace the first matching line (commented "# KEY=" or active "KEY="),
+    # drop any later duplicates, append if the key is not present.
+    # Values are passed via the environment so awk does not interpret escapes.
+    if ! CFG_KEY="$key" CFG_LINE="$new_line" awk '
+        BEGIN { key = ENVIRON["CFG_KEY"]; line = ENVIRON["CFG_LINE"]; done = 0 }
+        {
+            probe = $0
+            sub(/^[[:space:]]*#[[:space:]]*/, "", probe)
+            sub(/^[[:space:]]*/, "", probe)
+            if (index(probe, key "=") == 1) {
+                if (!done) { print line; done = 1 }
+                next
+            }
+            print
+        }
+        END { if (!done) print line }
+    ' "$file" > "$tmp"; then
+        rm -f "$tmp"
+        log_error "Failed to update ${key} in ${file}"
+        return 1
+    fi
+
+    mv -f "$tmp" "$file"
 
     # Apply secure permissions
     chmod 600 "$file" 2>/dev/null || true

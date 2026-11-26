@@ -60,7 +60,7 @@ sudo dnf install -y certbot
 sudo ln -sf /snap/bin/certbot /usr/bin/certbot
 
 # Re-run the installer:
-curl -sSL https://your-domain/install.sh | sudo bash
+curl -sSL https://raw.githubusercontent.com/shuvo-halder/certbot-smart-manager/main/install.sh | sudo bash
 ```
 
 ### 2. Systemd Timer Not Running
@@ -245,7 +245,7 @@ sudo ssl-manager --list-backups
 sudo ssl-manager --backup
 
 # Check backup content
-sudo ls -la /var/backups/certbot-smart-manager/latest/
+sudo ls -la /var/backups/certbot-smart-manager/<timestamp>/letsencrypt/
 ```
 
 ---

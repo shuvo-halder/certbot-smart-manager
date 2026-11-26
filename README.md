@@ -32,13 +32,13 @@
 ## 🚀 Quick Install
 
 ```bash
-curl -sSL https://your-domain/install.sh | sudo bash
+curl -sSL https://raw.githubusercontent.com/shuvo-halder/certbot-smart-manager/main/install.sh | sudo bash
 ```
 
 Or using wget:
 
 ```bash
-wget -O - https://your-domain/install.sh | sudo bash
+wget -O - https://raw.githubusercontent.com/shuvo-halder/certbot-smart-manager/main/install.sh | sudo bash
 ```
 
 The installer will:
@@ -79,7 +79,7 @@ The installer will:
 └── certbot-smart-manager.log    # Log file (chmod 640)
 
 /var/backups/certbot-smart-manager/
-└── YYYYMMDD_HHMMSS/            # Timestamped backups
+└── YYYYMMDD_HHMMSS/letsencrypt/ # Timestamped backups (chmod 700)
 ```
 
 ---
@@ -104,7 +104,7 @@ sudo ssl-manager
   4) Install new SSL certificate
   5) Dry run renewal
   6) View logs
-  7) Configure email notifications
+  7) Configure notifications
   8) Create backup
   9) List backups
  10) Force renew all certificates
@@ -226,10 +226,9 @@ sudo nano /etc/certbot-smart-manager/certbot-smart.conf
 
 ### Email (SMTP)
 
-The system tries these methods in order:
-1. Direct SMTP via curl (requires SMTP server, user, password)
-2. System `mail` command (if available)
-3. System `sendmail` command (if available)
+`SMTP_TO` (recipient) is always required. Then:
+1. If `SMTP_SERVER` is set: direct SMTP via curl (port 587 = STARTTLS, port 465 = implicit TLS). The password is passed to curl via a config file descriptor, so it never appears in `ps` output.
+2. Otherwise: the system `mail` command, or `sendmail` if `mail` is not installed.
 
 ---
 
@@ -240,10 +239,12 @@ The system tries these methods in order:
 | Fail-fast | `set -Eeuo pipefail` in every script |
 | Strict umask | `umask 027` — new files are 640, directories 750 |
 | Lock file | `flock`-based or PID-file fallback prevents duplicate execution |
-| No eval | No `eval` on user input; `eval` only on predefined package manager strings |
+| No eval | No `eval` on user input (certbot commands are built as arrays); `eval` only on predefined package manager strings in the installer |
+| Firewall safety | Only ports the tool opened itself are closed again; existing rules are never removed |
+| Secrets | Config values are stored single-quoted; SMTP password, bot token and webhook URL are never passed on the command line |
 | Input validation | Domain, email, and integer validation with regex |
 | Secure config | Configuration files are `chmod 600`, owned by root |
-| Shellcheck | All scripts are Shellcheck-compliant |
+| Shellcheck | Scripts are written to pass `shellcheck` |
 | Systemd hardening | `NoNewPrivileges`, `ProtectSystem`, `PrivateDevices`, etc. |
 | Safe cleanup | `trap` handlers close firewall ports, release locks on exit |
 
@@ -401,5 +402,5 @@ If you find this project useful, please give it a star on GitHub!
 - **Total code**: ~2,500+ lines of production Bash
 - **Files**: 15 files across 5 directories
 - **Modules**: 5 modular components
-- **Shellcheck**: 100% compliant
+- **Shellcheck**: written to pass `shellcheck`
 - **Security**: Hardened with systemd sandboxing and strict Bash options

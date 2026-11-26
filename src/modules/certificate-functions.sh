@@ -22,7 +22,26 @@ CERTIFICATE_NAMES=()
 CERTIFICATE_DOMAINS=()
 CERTIFICATE_EXPIRY_DATES=()
 CERTIFICATE_REMAINING_DAYS=()
-CERTIFICATE_STATUS=()      # "valid", "expiring_soon", "expired", "error"
+CERTIFICATE_STATUS=()      # "valid", "expiring_soon", "critical", "expired", "error"
+
+# Certbot only renews a certificate on its own when it is within this many
+# days of expiry (certbot's default `renew_before_expiry`). If our threshold
+# is larger, we must pass --force-renewal or certbot silently does nothing.
+CERTBOT_DEFAULT_RENEW_DAYS=30
+
+# =============================================================================
+# HELPERS
+# =============================================================================
+
+# Split CERTBOT_EXTRA_ARGS on spaces into the CERTBOT_EXTRA array.
+# (The global IFS is $'\n\t', so an unquoted expansion would NOT split on
+# spaces and "--a --b" would reach certbot as one single argument.)
+_load_certbot_extra_args() {
+    CERTBOT_EXTRA=()
+    if [[ -n "${CERTBOT_EXTRA_ARGS:-}" ]]; then
+        IFS=' ' read -r -a CERTBOT_EXTRA <<< "${CERTBOT_EXTRA_ARGS}"
+    fi
+}
 
 # =============================================================================
 # CERTIFICATE SCANNING
@@ -61,9 +80,10 @@ scan_certificates() {
         live_dir="${CERTBOT_LIVE_DIR:-/etc/letsencrypt/live}/${cert_name}"
         fullchain="${live_dir}/fullchain.pem"
 
+        CERTIFICATE_NAMES+=("$cert_name")
+
         if [[ ! -f "$fullchain" ]]; then
             log_warning "Certificate '${cert_name}': fullchain.pem not found at ${fullchain}"
-            CERTIFICATE_NAMES+=("$cert_name")
             CERTIFICATE_DOMAINS+=("$cert_name")
             CERTIFICATE_EXPIRY_DATES+=("unknown")
             CERTIFICATE_REMAINING_DAYS+=("-1")
@@ -71,46 +91,46 @@ scan_certificates() {
             continue
         fi
 
-        # Extract domains from renewal config
-        local domains_line domains
-        domains_line="$(grep -E '^\s*domains\s*=' "$conf_file" 2>/dev/null || true)"
-        if [[ -n "$domains_line" ]]; then
-            # Remove 'domains = ' prefix and split by commas
-            domains="$(printf '%s\n' "$domains_line" | sed 's/^.*=\s*//' | sed 's/,/ /g')"
-        else
-            domains="$cert_name"
-        fi
+        # Domains: read the SANs from the certificate itself (renewal .conf
+        # files do not contain a "domains =" line in modern certbot).
+        local domains
+        domains="$(openssl x509 -noout -text -in "$fullchain" 2>/dev/null \
+            | grep -o 'DNS:[^,[:space:]]*' | sed 's/^DNS://' | tr '\n' ' ' || true)"
+        domains="$(trim "$domains")"
+        [[ -z "$domains" ]] && domains="$cert_name"
         CERTIFICATE_DOMAINS+=("$domains")
 
-        # Extract expiry date from the certificate
-        expiry_date="$(openssl x509 -enddate -noout -in "$fullchain" 2>/dev/null | cut -d= -f2 || echo "unknown")"
-        CERTIFICATE_EXPIRY_DATES+=("$expiry_date")
-
-        # Calculate remaining days
-        if [[ "$expiry_date" != "unknown" ]]; then
-            expiry_epoch="$(date -d "$expiry_date" +%s 2>/dev/null || echo "0")"
-            now_epoch="$(date +%s)"
-            remaining=$(( (expiry_epoch - now_epoch) / 86400 ))
-            CERTIFICATE_REMAINING_DAYS+=("$remaining")
-
-            # Determine status
-            if [[ $remaining -le 0 ]]; then
-                CERTIFICATE_STATUS+=("expired")
-            elif [[ $remaining -le "${CRITICAL_THRESHOLD_DAYS:-7}" ]]; then
-                CERTIFICATE_STATUS+=("critical")
-            elif [[ $remaining -le "${THRESHOLD_DAYS:-30}" ]]; then
-                CERTIFICATE_STATUS+=("expiring_soon")
-            else
-                CERTIFICATE_STATUS+=("valid")
-            fi
-        else
-            CERTIFICATE_REMAINING_DAYS+=("-1")
-            CERTIFICATE_STATUS+=("error")
+        # Expiry date
+        expiry_date="$(openssl x509 -enddate -noout -in "$fullchain" 2>/dev/null | cut -d= -f2 || true)"
+        expiry_epoch=""
+        if [[ -n "$expiry_date" ]]; then
+            expiry_epoch="$(date -d "$expiry_date" +%s 2>/dev/null || true)"
         fi
 
-        CERTIFICATE_NAMES+=("$cert_name")
+        if [[ -z "$expiry_date" || -z "$expiry_epoch" ]]; then
+            log_warning "Certificate '${cert_name}': unable to read expiry date"
+            CERTIFICATE_EXPIRY_DATES+=("unknown")
+            CERTIFICATE_REMAINING_DAYS+=("-1")
+            CERTIFICATE_STATUS+=("error")
+            continue
+        fi
 
-        log_debug "Certificate: ${cert_name} | Domains: ${domains} | Expires: ${expiry_date} | Remaining: ${CERTIFICATE_REMAINING_DAYS[-1]} days | Status: ${CERTIFICATE_STATUS[-1]}"
+        CERTIFICATE_EXPIRY_DATES+=("$expiry_date")
+        now_epoch="$(date +%s)"
+        remaining=$(( (expiry_epoch - now_epoch) / 86400 ))
+        CERTIFICATE_REMAINING_DAYS+=("$remaining")
+
+        if [[ $remaining -le 0 ]]; then
+            CERTIFICATE_STATUS+=("expired")
+        elif [[ $remaining -le "${CRITICAL_THRESHOLD_DAYS:-7}" ]]; then
+            CERTIFICATE_STATUS+=("critical")
+        elif [[ $remaining -le "${THRESHOLD_DAYS:-30}" ]]; then
+            CERTIFICATE_STATUS+=("expiring_soon")
+        else
+            CERTIFICATE_STATUS+=("valid")
+        fi
+
+        log_debug "Certificate: ${cert_name} | Domains: ${domains} | Expires: ${expiry_date} | Remaining: ${remaining} days | Status: ${CERTIFICATE_STATUS[-1]}"
     done
 
     log_info "Scanned ${#CERTIFICATE_NAMES[@]} certificate(s)"
@@ -144,28 +164,24 @@ check_expiry_status() {
         status="${CERTIFICATE_STATUS[$i]}"
 
         case "$status" in
-            valid)           color="${COLOR_GREEN}"  ;;
-            expiring_soon)   color="${COLOR_YELLOW}" ;;
-            critical|expired) color="${COLOR_RED}"   ;;
-            error)           color="${COLOR_RED}"    ;;
-            *)               color="${COLOR_RESET}"  ;;
+            valid)            color="${COLOR_GREEN}"  ;;
+            expiring_soon)    color="${COLOR_YELLOW}" ;;
+            critical|expired) color="${COLOR_RED}"    ;;
+            error)            color="${COLOR_RED}"    ;;
+            *)                color="${COLOR_RESET}"  ;;
         esac
 
         printf '%b%-25s%b %s\n' "${COLOR_BOLD}" "Certificate:" "${COLOR_RESET}" "$name"
         printf '  %-23s %s\n' "Domains:" "$domains"
         printf '  %-23s %s\n' "Expires:" "$expiry"
         printf '  %-23s ' "Remaining Days:"
-        if [[ "$remaining" -ge 0 ]]; then
-            printf '%b%d days%b' "$color" "$remaining" "${COLOR_RESET}"
-            case "$status" in
-                valid)         printf ' (✓)' ;;
-                expiring_soon) printf ' (⚠  will renew)' ;;
-                critical)      printf ' (🔴 CRITICAL)' ;;
-                expired)       printf ' (✗ EXPIRED)' ;;
-            esac
-        else
-            printf 'unknown'
-        fi
+        case "$status" in
+            valid)         printf '%b%d days%b (✓)' "$color" "$remaining" "${COLOR_RESET}" ;;
+            expiring_soon) printf '%b%d days%b (⚠  will renew)' "$color" "$remaining" "${COLOR_RESET}" ;;
+            critical)      printf '%b%d days%b (🔴 CRITICAL)' "$color" "$remaining" "${COLOR_RESET}" ;;
+            expired)       printf '%bexpired %d day(s) ago%b (✗ EXPIRED)' "$color" "$(( -remaining ))" "${COLOR_RESET}" ;;
+            *)             printf '%bunknown%b' "$color" "${COLOR_RESET}" ;;
+        esac
         printf '\n\n'
     done
 }
@@ -175,16 +191,23 @@ check_expiry_status() {
 # =============================================================================
 
 # Renew a single certificate by name
-# Usage: renew_certificate <cert_name>
+# Usage: renew_certificate <cert_name> [remaining_days]
 # Returns: 0 on success, 1 on failure
 renew_certificate() {
     local cert_name="$1"
+    local remaining="${2:-0}"
     local live_dir="${CERTBOT_LIVE_DIR:-/etc/letsencrypt/live}/${cert_name}"
     local fullchain="${live_dir}/fullchain.pem"
     local before_mtime=""
     local after_mtime=""
     local rc=0
     local renewal_conf="${CERTBOT_RENEWAL_DIR:-/etc/letsencrypt/renewal}/${cert_name}.conf"
+    local max_retries="${MAX_RETRIES:-3}"
+    local retry_delay="${RETRY_DELAY_SECONDS:-10}"
+    local attempt
+
+    validate_positive_int "$max_retries" || max_retries=1
+    [[ "$retry_delay" =~ ^[0-9]+$ ]] || retry_delay=10
 
     if [[ ! -f "$renewal_conf" ]]; then
         log_error "Renewal configuration not found for: ${cert_name}"
@@ -196,26 +219,42 @@ renew_certificate() {
         before_mtime="$(stat -Lc '%Y' "$fullchain" 2>/dev/null || echo "")"
     fi
 
+    local certbot_args=(renew --cert-name "$cert_name" --quiet --non-interactive)
+
+    # Force renewal when requested, or when our threshold is wider than
+    # certbot's own renewal window (otherwise certbot would just skip it).
+    if [[ "${FORCE_RENEW:-false}" == "true" ]] || [[ "$remaining" -gt "$CERTBOT_DEFAULT_RENEW_DAYS" ]]; then
+        certbot_args+=(--force-renewal)
+    fi
+
+    _load_certbot_extra_args
+    certbot_args+=(${CERTBOT_EXTRA[@]+"${CERTBOT_EXTRA[@]}"})
+
     log_info "Renewing certificate: ${cert_name}"
 
-    # Open firewall ports if needed
+    # Open firewall ports if needed (closed again below, and by the EXIT trap)
     open_firewall_ports
 
-    # Run certbot renewal
-    set +e
-    certbot renew --cert-name "$cert_name" --quiet --non-interactive ${CERTBOT_EXTRA_ARGS:-}
-    rc=$?
-    set -e
+    for (( attempt = 1; attempt <= max_retries; attempt++ )); do
+        set +e
+        certbot "${certbot_args[@]}"
+        rc=$?
+        set -e
 
-    # Close firewall ports
+        [[ $rc -eq 0 ]] && break
+
+        if [[ $attempt -lt $max_retries ]]; then
+            log_warning "Renewal attempt ${attempt}/${max_retries} for ${cert_name} failed (exit code: ${rc}); retrying in ${retry_delay}s..."
+            sleep "$retry_delay"
+        fi
+    done
+
     close_firewall_ports
 
     if [[ $rc -ne 0 ]]; then
-        log_error "Renewal failed for ${cert_name} (exit code: ${rc})"
+        log_error "Renewal failed for ${cert_name} after ${max_retries} attempt(s) (exit code: ${rc})"
         return 1
     fi
-
-    log_success "Renewed ${cert_name}"
 
     # Check if certificate was actually updated
     if [[ -e "$fullchain" ]]; then
@@ -223,14 +262,15 @@ renew_certificate() {
     fi
 
     if [[ -n "$before_mtime" && -n "$after_mtime" && "$before_mtime" != "$after_mtime" ]]; then
-        log_info "Certificate updated for ${cert_name}; reloading web server."
+        log_success "Renewed ${cert_name}"
         if [[ "${RELOAD_WEB_SERVER:-true}" == "true" ]]; then
+            log_info "Certificate updated for ${cert_name}; reloading web server."
             reload_web_server
         else
             log_info "Web server reload disabled by configuration."
         fi
     else
-        log_debug "No certificate change detected for ${cert_name}; reload skipped."
+        log_info "certbot finished for ${cert_name}, but the certificate was not changed (not yet due according to certbot); reload skipped."
     fi
 
     return 0
@@ -259,6 +299,7 @@ renew_all_certificates() {
 
         if [[ "$status" == "error" ]]; then
             log_warning "Skipping ${cert_name}: unable to determine status"
+            send_error_notification "Unable to read certificate '${cert_name}' — please inspect /etc/letsencrypt/live/${cert_name}/"
             skipped=$((skipped + 1))
             continue
         fi
@@ -266,11 +307,10 @@ renew_all_certificates() {
         if [[ "$remaining" -le "${THRESHOLD_DAYS:-30}" ]] || [[ "${FORCE_RENEW:-false}" == "true" ]]; then
             log_info "Certificate '${cert_name}': ${remaining} days remaining (threshold: ${THRESHOLD_DAYS:-30})"
 
-            if renew_certificate "$cert_name"; then
+            if renew_certificate "$cert_name" "$remaining"; then
                 renewed=$((renewed + 1))
             else
                 failed=$((failed + 1))
-                # Send notification for failed renewal
                 send_renewal_failure_notification "$cert_name" "${CERTIFICATE_DOMAINS[$i]}" "${CERTIFICATE_EXPIRY_DATES[$i]}" "$remaining"
             fi
         else
@@ -279,7 +319,7 @@ renew_all_certificates() {
         fi
     done
 
-    log_info "Renewal complete: ${renewed} renewed, ${failed} failed, ${skipped} skipped"
+    log_info "Renewal complete: ${renewed} processed, ${failed} failed, ${skipped} skipped"
 
     if [[ $failed -gt 0 ]]; then
         return 1
@@ -293,8 +333,8 @@ renew_all_certificates() {
 
 # Interactive installation of a new SSL certificate
 install_new_certificate_interactive() {
-    local domain subdomain email web_server domains
-    local plugin domains_list
+    local domain subdomain email plugin extra_domains confirm
+    local domains_list=()
 
     echo_bold ""
     echo_bold "========================================"
@@ -308,18 +348,19 @@ install_new_certificate_interactive() {
 
     if [[ "$plugin" == "manual" ]]; then
         echo_warning "No supported web server detected (Nginx/Apache)."
-        echo_info "You will need to use the 'certbot certonly' method manually."
-        echo_info "Proceeding with manual mode..."
+        echo_info "Falling back to certbot's standalone mode ('certonly --standalone')."
+        echo_info "Port 80 must be free during issuance; you will need to configure"
+        echo_info "your server to use the certificate yourself."
     else
         echo_info "Detected web server plugin: ${plugin}"
     fi
 
-    # Gather domain information
+    # Primary domain
     echo ""
     echo_info "Enter the primary domain (e.g., example.com):"
     printf "> "
-    read -r domain
-    domain="$(printf '%s' "$domain" | tr '[:upper:]' '[:lower:]' | xargs)"
+    read -r domain || return 1
+    domain="$(to_lower "$(trim "$domain")")"
 
     if [[ -z "$domain" ]]; then
         echo_error "Domain cannot be empty."
@@ -330,20 +371,29 @@ install_new_certificate_interactive() {
         echo_error "Invalid domain format: ${domain}"
         return 1
     fi
+    domains_list+=("$domain")
 
-    # Optional subdomain
+    # Optional subdomain (added IN ADDITION to the primary domain)
     echo ""
     echo_info "Enter subdomain (optional, e.g., www):"
     printf "> "
-    read -r subdomain
-    subdomain="$(printf '%s' "$subdomain" | tr '[:upper:]' '[:lower:]' | xargs)"
+    read -r subdomain || subdomain=""
+    subdomain="$(to_lower "$(trim "$subdomain")")"
+
+    if [[ -n "$subdomain" ]]; then
+        if validate_domain "${subdomain}.${domain}"; then
+            domains_list+=("${subdomain}.${domain}")
+        else
+            echo_warning "Skipping invalid subdomain: ${subdomain}.${domain}"
+        fi
+    fi
 
     # Email address
     echo ""
     echo_info "Enter email address for registration/renewal notifications:"
     printf "> "
-    read -r email
-    email="$(printf '%s' "$email" | xargs)"
+    read -r email || return 1
+    email="$(trim "$email")"
 
     if [[ -z "$email" ]]; then
         echo_error "Email cannot be empty."
@@ -355,101 +405,107 @@ install_new_certificate_interactive() {
         return 1
     fi
 
-    # Build domain list
-    domains_list="$domain"
-    if [[ -n "$subdomain" ]]; then
-        domains_list="${subdomain}.${domain}"
-    fi
-
-    # Ask for additional domains
+    # Additional domains
     echo ""
     echo_info "Enter additional domains (comma-separated, or leave empty):"
     echo_info "Example: api.example.com, admin.example.com"
     printf "> "
-    read -r extra_domains
-    extra_domains="$(printf '%s' "$extra_domains" | xargs)"
+    read -r extra_domains || extra_domains=""
 
-    if [[ -n "$extra_domains" ]]; then
-        local IFS=',' extra_domain
-        for extra_domain in $extra_domains; do
-            extra_domain="$(printf '%s' "$extra_domain" | xargs | tr '[:upper:]' '[:lower:]')"
+    if [[ -n "$(trim "$extra_domains")" ]]; then
+        local extras=() extra_domain
+        IFS=',' read -r -a extras <<< "$extra_domains"
+        for extra_domain in "${extras[@]}"; do
+            extra_domain="$(to_lower "$(trim "$extra_domain")")"
+            [[ -z "$extra_domain" ]] && continue
             if validate_domain "$extra_domain"; then
-                domains_list="${domains_list} ${extra_domain}"
+                domains_list+=("$extra_domain")
             else
                 echo_warning "Skipping invalid domain: ${extra_domain}"
             fi
         done
     fi
 
+    # Space-joined copy for display (the global IFS is newline+tab, so
+    # "${domains_list[*]}" would join with newlines)
+    local domains_str
+    domains_str="$(IFS=' '; printf '%s' "${domains_list[*]}")"
+
     # Confirmation
     echo ""
     echo_bold "Summary:"
     echo "  Plugin:     ${plugin}"
     echo "  Email:      ${email}"
-    echo "  Domains:    ${domains_list}"
+    echo "  Domains:    ${domains_str}"
     echo ""
 
     echo_info "Proceed with installation? [Y/n]"
     printf "> "
-    read -r confirm
-    confirm="$(printf '%s' "$confirm" | tr '[:upper:]' '[:lower:]' | xargs)"
+    read -r confirm || confirm="n"
+    confirm="$(to_lower "$(trim "$confirm")")"
 
-    if [[ "$confirm" != "y" ]] && [[ "$confirm" != "yes" ]] && [[ -n "$confirm" ]]; then
+    if [[ -n "$confirm" ]] && [[ "$confirm" != "y" ]] && [[ "$confirm" != "yes" ]]; then
         echo_info "Installation cancelled."
         return 0
     fi
 
-    # Build the certbot command
-    local certbot_cmd="certbot --${plugin}"
-    local domain_part=""
+    # Build the certbot command as an array — no eval, no word-splitting issues
+    local certbot_args=()
+    if [[ "$plugin" == "manual" ]]; then
+        certbot_args+=(certonly --standalone)
+    else
+        certbot_args+=("--${plugin}")
+    fi
+    certbot_args+=(--non-interactive --agree-tos --email "$email")
+
     local d
-    for d in $domains_list; do
-        domain_part="${domain_part} -d ${d}"
+    for d in "${domains_list[@]}"; do
+        certbot_args+=(-d "$d")
     done
 
-    certbot_cmd="${certbot_cmd} --non-interactive --agree-tos --email ${email} ${domain_part}"
+    _load_certbot_extra_args
+    certbot_args+=(${CERTBOT_EXTRA[@]+"${CERTBOT_EXTRA[@]}"})
 
     echo ""
-    echo_info "Executing: ${certbot_cmd}"
+    echo_info "Executing: certbot $(IFS=' '; printf '%s' "${certbot_args[*]}")"
     echo ""
 
-    # Open firewall ports
     open_firewall_ports
 
-    # Run certbot
+    local rc=0
     set +e
-    if eval "$certbot_cmd"; then
-        set -e
-        close_firewall_ports
-        echo_success ""
-        echo_success "Certificate installed successfully!"
-        echo_success "Domains: ${domains_list}"
-        echo ""
+    certbot "${certbot_args[@]}"
+    rc=$?
+    set -e
 
-        # Reload web server
-        if [[ "${RELOAD_WEB_SERVER:-true}" == "true" ]]; then
-            reload_web_server
-        fi
+    close_firewall_ports
 
-        log_success "Installed certificate for: ${domains_list}"
-
-        # Show certificate info
-        local first_domain
-        first_domain="$(printf '%s\n' "$domains_list" | awk '{print $1}')"
-        local live_dir="${CERTBOT_LIVE_DIR:-/etc/letsencrypt/live}/${first_domain}"
-        if [[ -f "${live_dir}/fullchain.pem" ]]; then
-            local expiry
-            expiry="$(openssl x509 -enddate -noout -in "${live_dir}/fullchain.pem" 2>/dev/null | cut -d= -f2 || echo "unknown")"
-            echo_info "Certificate expires: ${expiry}"
-        fi
-    else
-        set -e
-        close_firewall_ports
+    if [[ $rc -ne 0 ]]; then
         echo_error ""
-        echo_error "Certificate installation FAILED."
-        echo_error "Check: 'certbot certificates' for details."
-        log_error "Certificate installation failed for: ${domains_list}"
+        echo_error "Certificate installation FAILED (exit code: ${rc})."
+        echo_error "Check: 'certbot certificates' and /var/log/letsencrypt/letsencrypt.log"
+        log_error "Certificate installation failed for: ${domains_str}"
         return 1
+    fi
+
+    echo_success ""
+    echo_success "Certificate installed successfully!"
+    echo_success "Domains: ${domains_str}"
+    echo ""
+
+    # The nginx/apache installers reload the server themselves; standalone does not touch it
+    if [[ "$plugin" != "manual" ]] && [[ "${RELOAD_WEB_SERVER:-true}" == "true" ]]; then
+        reload_web_server
+    fi
+
+    log_success "Installed certificate for: ${domains_str}"
+
+    # Show certificate info (certbot names the lineage after the first -d)
+    local live_dir="${CERTBOT_LIVE_DIR:-/etc/letsencrypt/live}/${domains_list[0]}"
+    if [[ -f "${live_dir}/fullchain.pem" ]]; then
+        local expiry
+        expiry="$(openssl x509 -enddate -noout -in "${live_dir}/fullchain.pem" 2>/dev/null | cut -d= -f2 || echo "unknown")"
+        echo_info "Certificate expires: ${expiry}"
     fi
 }
 
@@ -461,11 +517,16 @@ install_new_certificate_interactive() {
 dry_run_renewal() {
     log_info "Starting dry-run renewal..."
 
+    local certbot_args=(renew --dry-run --quiet --non-interactive)
+    _load_certbot_extra_args
+    certbot_args+=(${CERTBOT_EXTRA[@]+"${CERTBOT_EXTRA[@]}"})
+
     open_firewall_ports
 
+    local rc=0
     set +e
-    certbot renew --dry-run --quiet --non-interactive ${CERTBOT_EXTRA_ARGS:-}
-    local rc=$?
+    certbot "${certbot_args[@]}"
+    rc=$?
     set -e
 
     close_firewall_ports
@@ -490,17 +551,21 @@ dry_run_renewal() {
 
 # Force renewal of all certificates regardless of expiry
 force_renew_all() {
-    FORCE_RENEW=true
+    local rc=0
+
     echo_warning "Forcing renewal of all certificates..."
     log_warning "Force renewal initiated"
 
     # First backup
     if [[ "${BACKUP_ENABLED:-true}" == "true" ]]; then
-        backup_letsencrypt
+        backup_letsencrypt || log_warning "Backup failed; continuing with forced renewal"
     fi
 
-    renew_all_certificates
+    FORCE_RENEW=true
+    renew_all_certificates || rc=$?
     FORCE_RENEW=false
+
+    return $rc
 }
 
 # =============================================================================
@@ -528,34 +593,22 @@ display_certificates_table() {
         status="${CERTIFICATE_STATUS[$i]}"
 
         case "$status" in
-            valid)   color="${COLOR_GREEN}${COLOR_BOLD}"   ;;
+            valid)                  color="${COLOR_GREEN}${COLOR_BOLD}"  ;;
             expiring_soon|critical) color="${COLOR_YELLOW}${COLOR_BOLD}" ;;
-            expired|error) color="${COLOR_RED}${COLOR_BOLD}" ;;
+            *)                      color="${COLOR_RED}${COLOR_BOLD}"    ;;
         esac
 
-        printf '%s%-40s %s' "$color" "$name" "${COLOR_RESET}"
+        # %b so the ANSI escape sequences are interpreted, not printed literally
+        printf '%b%-40s%b' "$color" "$name" "${COLOR_RESET}"
         printf '  Domains: %s\n' "$domains"
 
-        if [[ "$remaining" -ge 0 ]]; then
-            case "$status" in
-                valid)         printf '  Status: ✓ Valid (%d days remaining)\n' "$remaining" ;;
-                expiring_soon) printf '  Status: ⚠ Expiring (%d days)\n' "$remaining" ;;
-                critical)      printf '  Status: 🔴 Critical (%d days)\n' "$remaining" ;;
-                expired)       printf '  Status: ✗ EXPIRED\n' ;;
-            esac
-        else
-            printf '  Status: ✗ Error reading certificate\n'
-        fi
+        case "$status" in
+            valid)         printf '  Status: ✓ Valid (%d days remaining)\n' "$remaining" ;;
+            expiring_soon) printf '  Status: ⚠ Expiring (%d days)\n' "$remaining" ;;
+            critical)      printf '  Status: 🔴 Critical (%d days)\n' "$remaining" ;;
+            expired)       printf '  Status: ✗ EXPIRED\n' ;;
+            *)             printf '  Status: ✗ Error reading certificate\n' ;;
+        esac
         echo ""
     done
-}
-
-# =============================================================================
-# EXIT TRAP CLEANUP
-# =============================================================================
-
-# Cleanup function for certificate operations
-cleanup_certificate_ops() {
-    # Close any open firewall ports as safety measure
-    close_firewall_ports 2>/dev/null || true
 }

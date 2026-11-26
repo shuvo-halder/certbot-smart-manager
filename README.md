@@ -68,6 +68,11 @@ The installer will:
 /etc/certbot-smart-manager/
 └── certbot-smart.conf           # Configuration (chmod 600)
 
+/etc/letsencrypt/renewal-hooks/deploy/
+└── certbot-smart-manager-reload.sh  # Reloads nginx/apache after ANY renewal
+
+/var/lib/certbot-smart-manager/  # Notification throttling state
+
 /usr/local/bin/
 └── ssl-manager -> /usr/local/lib/certbot-smart-manager/certbot-smart-manager.sh
 
@@ -109,9 +114,10 @@ sudo ssl-manager
   9) List backups
  10) Force renew all certificates
  11) Configure renewal threshold
+ 12) Renew one certificate (manual/DNS certificates)
   0) Exit
 
-Enter choice [0-11]:
+Enter choice [0-12]:
 ```
 
 ### Command-Line Options
@@ -122,9 +128,10 @@ Enter choice [0-11]:
 | `--scan` | Scan and display all certificates |
 | `--check` | Check and display expiry status |
 | `--renew` | Renew certificates that need renewal |
-| `--force-renew` | Force renewal of all certificates |
+| `--force-renew` | Force renewal of all automatic certificates |
+| `--renew-cert NAME` | Renew one certificate now (interactive for manual/DNS certificates) |
 | `--dry-run` | Simulate renewal (no changes) |
-| `--install` | Interactive certificate installation wizard |
+| `--install` | Request a certificate for a new domain (interactive wizard) |
 | `--view-logs` | Display the log file |
 | `--configure` | Configure notification settings |
 | `--backup` | Create a backup of `/etc/letsencrypt/` |
@@ -194,6 +201,37 @@ sudo systemctl start certbot-smart.service
 
 ---
 
+## 🔁 Certificate Lifecycle
+
+```
+install.sh (once)
+   │
+   ├─ sudo ssl-manager --install      ← once per NEW domain
+   │      ├─ 1) Automatic (nginx / apache / standalone)
+   │      └─ 2) Manual DNS (TXT record, wildcards *.example.com)
+   │
+   └─ certbot-smart.timer, twice daily → ssl-manager --auto
+          ├─ automatic certificates → renewed when ≤ THRESHOLD_DAYS left,
+          │                           web server reloaded via deploy hook
+          └─ manual certificates    → never auto-renewed; logged every run,
+                                      reminder notification once a day when
+                                      ≤ THRESHOLD_DAYS left
+                                      → sudo ssl-manager --renew-cert <name>
+```
+
+A certificate counts as **manual** when its renewal config has
+`authenticator = manual` and no `manual_auth_hook`. Manual certificates that
+do have an auth hook (e.g. a DNS API script) are renewed automatically.
+Certificates that already exist in `/etc/letsencrypt` are picked up
+automatically; nothing needs to be re-issued.
+
+`--scan` and `--check` show the renewal mode of every certificate.
+
+On a failed automatic renewal, the notification includes the last lines of
+certbot's output, and the full output is written to the log.
+
+---
+
 ## 🔔 Notification Configuration
 
 Configure notifications via the interactive menu (`ssl-manager --configure`) or edit:
@@ -245,7 +283,7 @@ sudo nano /etc/certbot-smart-manager/certbot-smart.conf
 | Input validation | Domain, email, and integer validation with regex |
 | Secure config | Configuration files are `chmod 600`, owned by root |
 | Shellcheck | Scripts are written to pass `shellcheck` |
-| Systemd hardening | `NoNewPrivileges`, `ProtectSystem`, `PrivateDevices`, etc. |
+| Systemd hardening | `ProtectSystem=true`, `PrivateTmp`, `ProtectKernelModules`, etc. — kept moderate on purpose so snap-installed certbot, nginx/apache plugins and `/home` webroots can still renew (see comments in the unit file) |
 | Safe cleanup | `trap` handlers close firewall ports, release locks on exit |
 
 ---
@@ -403,4 +441,4 @@ If you find this project useful, please give it a star on GitHub!
 - **Files**: 15 files across 5 directories
 - **Modules**: 5 modular components
 - **Shellcheck**: written to pass `shellcheck`
-- **Security**: Hardened with systemd sandboxing and strict Bash options
+- **Security**: Strict Bash options, root-only config/backups, no secrets on the command line

@@ -18,24 +18,25 @@ StandardError=journal
 Environment=HOME=/root
 Environment=CONFIG_FILE=/etc/certbot-smart-manager/certbot-smart.conf
 
-# Security hardening
+# Security hardening — deliberately moderate.
 #
-# ProtectSystem=true (not "full"): /usr and /boot are read-only, but /etc
-# stays writable. certbot's nginx/apache plugins edit /etc/nginx or
-# /etc/apache2 during renewal, and ufw/firewalld write under /etc — with
-# "full" those renewals and firewall changes would fail.
-# PrivateDevices is not set so `wall` console notifications can reach TTYs.
+# The job of this unit is to renew certificates unattended; a sandbox that
+# makes renewal fail defeats the purpose. Options that are intentionally
+# NOT used, and why:
+#   ProtectSystem=full/strict  certbot's nginx/apache plugins edit /etc/nginx,
+#                              /etc/apache2; ufw/firewalld write under /etc.
+#   ProtectHome                webroot challenges often live under /home/*/.
+#   NoNewPrivileges,           snap-installed certbot (the method certbot's
+#   RestrictNamespaces,        own docs recommend) runs through snap-confine,
+#   CapabilityBoundingSet,     which needs setuid, mount namespaces,
+#   ProtectControlGroups,      CAP_SYS_ADMIN and cgroup access — every one of
+#   ProtectKernelTunables      these would make every snap renewal fail.
+#   PrivateDevices             `wall` console notifications need the TTYs.
 LockPersonality=yes
-NoNewPrivileges=yes
 PrivateTmp=yes
-ProtectHome=yes
 ProtectSystem=true
-CapabilityBoundingSet=CAP_NET_BIND_SERVICE CAP_NET_RAW CAP_NET_ADMIN CAP_DAC_OVERRIDE CAP_DAC_READ_SEARCH CAP_CHOWN CAP_FOWNER CAP_SETUID CAP_SETGID CAP_KILL
-ProtectKernelTunables=yes
 ProtectKernelModules=yes
-ProtectControlGroups=yes
 RestrictRealtime=yes
-RestrictNamespaces=yes
 
 [Install]
 WantedBy=multi-user.target

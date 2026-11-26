@@ -44,26 +44,66 @@ EOF
 }
 
 # Build a failure notification message
-# Usage: build_failure_message <domain> <expiry_date> <remaining_days>
+# Usage: build_failure_message <cert_name> <expiry_date> <remaining_days> [certbot_output]
 build_failure_message() {
     local domain="$1"
     local expiry_date="$2"
     local remaining_days="$3"
+    local certbot_output="${4:-}"
 
     cat <<EOF
 ========================================
 ALERT: SSL Certificate Renewal FAILED
 ========================================
-Domain:        ${domain}
+Host:          $(hostname -f 2>/dev/null || hostname)
+Certificate:   ${domain}
 Expires:       ${expiry_date}
 Remaining:     ${remaining_days} days
-Status:        Automatic renewal FAILED
+Status:        Automatic renewal FAILED (will be retried on the next run)
+EOF
+    if [[ -n "$certbot_output" ]]; then
+        printf '\ncertbot output (last lines):\n%s\n' "$certbot_output"
+    fi
+    cat <<EOF
 
 Action Required:
-1. Check certbot logs: /var/log/letsencrypt/letsencrypt.log
+1. Full output: ${LOG_FILE:-/var/log/certbot-smart-manager.log}
+   and /var/log/letsencrypt/letsencrypt.log
 2. Verify DNS records for the domain
 3. Ensure ports 80 and 443 are accessible
-4. Run: certbot renew --cert-name ${domain}
+4. Test: sudo ssl-manager --dry-run
+5. Retry: sudo ssl-manager --renew-cert ${domain}
+
+This notification was sent by certbot-smart-manager
+========================================
+EOF
+}
+
+# Build a "manual renewal required" message
+# Usage: build_manual_renewal_message <cert_name> <domains> <expiry_date> <remaining_days>
+build_manual_renewal_message() {
+    local cert_name="$1"
+    local domains="$2"
+    local expiry_date="$3"
+    local remaining_days="$4"
+
+    cat <<EOF
+========================================
+ACTION REQUIRED: Manual SSL Renewal
+========================================
+Host:          $(hostname -f 2>/dev/null || hostname)
+Certificate:   ${cert_name}
+Domains:       ${domains}
+Expires:       ${expiry_date}
+Remaining:     ${remaining_days} days
+
+This certificate was issued with manual validation (e.g. a DNS TXT
+record) and cannot be renewed automatically.
+
+Renew it on the server with:
+  sudo ssl-manager --renew-cert ${cert_name}
+
+You will be reminded once a day until it is renewed.
 
 This notification was sent by certbot-smart-manager
 ========================================
@@ -370,10 +410,23 @@ send_renewal_failure_notification() {
     local domains="$2"
     local expiry_date="$3"
     local remaining_days="$4"
+    local certbot_output="${5:-}"
 
     local message
-    message="$(build_failure_message "$cert_name" "$expiry_date" "$remaining_days")"
+    message="$(build_failure_message "$cert_name" "$expiry_date" "$remaining_days" "$certbot_output")"
     dispatch_notification "$message" "ERROR" "ALERT: SSL Renewal Failed - ${cert_name}"
+}
+
+# Send a reminder that a manual-mode certificate needs renewing
+send_manual_renewal_notification() {
+    local cert_name="$1"
+    local domains="$2"
+    local expiry_date="$3"
+    local remaining_days="$4"
+
+    local message
+    message="$(build_manual_renewal_message "$cert_name" "$domains" "$expiry_date" "$remaining_days")"
+    dispatch_notification "$message" "WARNING" "ACTION REQUIRED: Manual SSL renewal - ${cert_name} (${remaining_days} days left)"
 }
 
 # Send notification about a certificate expiring soon

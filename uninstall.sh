@@ -38,6 +38,8 @@ BIN_DEST="/usr/local/bin"
 CONFIG_DIR="/etc/${PROJECT_NAME}"
 LOG_FILE="/var/log/${PROJECT_NAME}.log"
 LOCK_FILE="/var/lock/${PROJECT_NAME}.lock"
+STATE_DIR="/var/lib/${PROJECT_NAME}"
+DEPLOY_HOOK="/etc/letsencrypt/renewal-hooks/deploy/${PROJECT_NAME}-reload.sh"
 BACKUP_DIR="/var/backups/${PROJECT_NAME}"
 SYSTEMD_DIR="/etc/systemd/system"
 CRON_DIR="/etc/cron.d"
@@ -177,6 +179,25 @@ remove_config() {
         echo_success "Configuration removed: ${CONFIG_DIR}/"
     else
         echo_info "Configuration not found (already clean): ${CONFIG_DIR}/"
+    fi
+}
+
+# Step 4b: Remove the certbot deploy hook and the state directory.
+# Only OUR hook file is removed — /etc/letsencrypt itself (certificates,
+# keys, other hooks) is never touched.
+remove_hook_and_state() {
+    echo_info "Removing certbot deploy hook and state directory..."
+
+    if [[ -f "$DEPLOY_HOOK" ]]; then
+        rm -f "$DEPLOY_HOOK"
+        echo_success "Deploy hook removed: ${DEPLOY_HOOK}"
+    else
+        echo_info "Deploy hook not found (already clean): ${DEPLOY_HOOK}"
+    fi
+
+    if [[ -d "$STATE_DIR" ]]; then
+        rm -rf "$STATE_DIR"
+        echo_success "State directory removed: ${STATE_DIR}/"
     fi
 }
 
@@ -361,6 +382,8 @@ main() {
     echo "  - ${BIN_DEST}/${SCRIPT_NAME}        (symlink)"
     echo "  - ${LIB_DEST}/                      (library & modules)"
     echo "  - ${CONFIG_DIR}/                    (configuration)"
+    echo "  - ${DEPLOY_HOOK}  (certbot deploy hook)"
+    echo "  - ${STATE_DIR}/                     (notification state)"
     echo "  - ${LOG_FILE}                       (log file)"
     echo "  - ${LOCK_FILE}                      (lock file)"
     echo "  - systemd units: ${UNIT_NAME}.service, ${UNIT_NAME}.timer"
@@ -392,6 +415,7 @@ main() {
 
     echo_bold "--- Step 4/8: Remove Configuration ---"
     remove_config
+    remove_hook_and_state
     separator
 
     echo_bold "--- Step 5/8: Remove Log File ---"

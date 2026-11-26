@@ -50,7 +50,10 @@ CONFIG_DEST="${CONFIG_DIR}/${CONFIG_NAME}"
 LOG_FILE="/var/log/${PROJECT_NAME}.log"
 LOCK_FILE="/var/lock/${PROJECT_NAME}.lock"
 BACKUP_DIR="/var/backups/${PROJECT_NAME}"
+STATE_DIR="/var/lib/${PROJECT_NAME}"
 SYSTEMD_DIR="/etc/systemd/system"
+# certbot runs every executable here after each successful renewal
+DEPLOY_HOOK_DEST="/etc/letsencrypt/renewal-hooks/deploy/${PROJECT_NAME}-reload.sh"
 
 # Where to download the sources from when not run from a checkout
 REPO_TARBALL_URL="${REPO_TARBALL_URL:-https://github.com/shuvo-halder/certbot-smart-manager/archive/refs/heads/main.tar.gz}"
@@ -89,6 +92,7 @@ set_source_paths() {
     CONFIG_SRC="${SRC_DIR}/config/${CONFIG_NAME}"
     SERVICE_SRC="${SRC_DIR}/systemd/${UNIT_NAME}.service"
     TIMER_SRC="${SRC_DIR}/systemd/${UNIT_NAME}.timer"
+    HOOK_SRC="${SRC_DIR}/hooks/deploy-reload.sh"
 }
 
 _self="${BASH_SOURCE[0]:-$0}"
@@ -408,6 +412,7 @@ create_directories() {
         "$MODULES_DEST"
         "$CONFIG_DIR"
         "$BACKUP_DIR"
+        "$STATE_DIR"
     )
 
     local dir
@@ -550,6 +555,23 @@ migrate_legacy_units() {
 }
 
 # Step 9: Install systemd service + timer (always refreshed on upgrade)
+# Install the certbot deploy hook that reloads nginx/apache after EVERY
+# successful renewal — including renewals done by certbot's own timer
+# (certbot.timer / snap.certbot.renew.timer), which would otherwise leave
+# the web server serving the old certificate until it expires.
+install_deploy_hook() {
+    echo_info "Installing certbot deploy hook..."
+
+    if [[ ! -f "$HOOK_SRC" ]]; then
+        echo_warning "Deploy hook source not found: ${HOOK_SRC}; skipping."
+        return 0
+    fi
+
+    mkdir -p "$(dirname "$DEPLOY_HOOK_DEST")"
+    _install_text_file 755 "$HOOK_SRC" "$DEPLOY_HOOK_DEST"
+    echo_success "Deploy hook installed: ${DEPLOY_HOOK_DEST}"
+}
+
 install_systemd_units() {
     if ! command_exists systemctl; then
         echo_warning "systemd not available; skipping systemd installation."
@@ -854,6 +876,28 @@ show_summary() {
     fi
 
     echo ""
+    echo_bold "Next steps:"
+    echo "  1. Request a certificate for each new domain (one time per domain):"
+    echo "       sudo ssl-manager --install"
+    echo "     Existing certificates in /etc/letsencrypt are picked up automatically."
+    echo "  2. Set up notifications so you hear about failures / manual renewals:"
+    echo "       sudo ssl-manager --configure"
+    echo "  3. Verify unattended renewal works:"
+    echo "       sudo ssl-manager --dry-run"
+    echo ""
+    echo "  After that, renewal is automatic. Only certificates issued with manual"
+    echo "  DNS validation need you: you get a reminder, then run"
+    echo "       sudo ssl-manager --renew-cert <name>"
+
+    local method
+    method="$(sed -n "s/^[[:space:]]*NOTIFICATION_METHOD=[\"']\{0,1\}\([a-z]*\).*/\1/p" "$CONFIG_DEST" 2>/dev/null | head -n 1)"
+    if [[ -z "$method" || "$method" == "console" || "$method" == "log" ]]; then
+        echo ""
+        echo_warning "Notifications are '${method:-console}' only (wall/log). On a server where nobody is"
+        echo_warning "logged in, a failed renewal would go unnoticed. Run: sudo ssl-manager --configure"
+    fi
+
+    echo ""
     echo_success "Installation complete!"
     echo ""
 
@@ -902,6 +946,9 @@ main() {
     echo ""
 
     setup_permissions
+    echo ""
+
+    install_deploy_hook
     echo ""
 
     install_systemd_units

@@ -50,11 +50,12 @@ THRESHOLD_DAYS="${THRESHOLD_DAYS:-30}"
 CRITICAL_THRESHOLD_DAYS="${CRITICAL_THRESHOLD_DAYS:-7}"
 LOG_LEVEL="${LOG_LEVEL:-INFO}"
 NOTIFICATION_METHOD="${NOTIFICATION_METHOD:-console}"
+STATE_DIR="${STATE_DIR:-/var/lib/certbot-smart-manager}"
 
 # Export globally so sourced modules can rely on them
 export LOG_FILE LOCK_FILE BACKUP_DIR BACKUP_ENABLED
 export BACKUP_RETENTION_DAYS THRESHOLD_DAYS CRITICAL_THRESHOLD_DAYS
-export LOG_LEVEL NOTIFICATION_METHOD
+export LOG_LEVEL NOTIFICATION_METHOD STATE_DIR
 
 LOCK_HELD=false
 
@@ -123,9 +124,10 @@ Options:
   --scan             Scan and display certificates
   --check            Check expiry status
   --renew            Renew certificates that need renewal
-  --force-renew      Force renewal of all certificates
+  --force-renew      Force renewal of all automatic certificates
+  --renew-cert NAME  Renew one certificate now (interactive for manual/DNS certs)
   --dry-run          Perform a dry-run renewal
-  --install          Interactive certificate installation
+  --install          Request a certificate for a new domain (interactive)
   --view-logs        Display the log file
   --configure        Configure notifications
   --backup           Create a backup of /etc/letsencrypt/
@@ -140,6 +142,7 @@ Examples:
   ssl-manager --scan             Scan certificates
   ssl-manager --dry-run          Test renewal
   ssl-manager --force-renew      Force renew all certificates
+  ssl-manager --renew-cert example.com   Renew one certificate (e.g. a manual DNS one)
   ssl-manager --configure        Configure notification settings
 EOF
 }
@@ -217,6 +220,17 @@ renew_with_backup() {
     renew_all_certificates
 }
 
+# Menu helper: ask which certificate to renew
+_renew_one_interactive() {
+    local name
+    display_certificates_table
+    printf "Certificate name to renew: "
+    read -r name || return 0
+    name="$(trim "$name")"
+    [[ -z "$name" ]] && return 0
+    renew_single_certificate "$name"
+}
+
 # Interactive menu
 show_menu() {
     local choice
@@ -240,9 +254,10 @@ show_menu() {
         echo_info "  9) List backups"
         echo_info " 10) Force renew all certificates"
         echo_info " 11) Configure renewal threshold"
+        echo_info " 12) Renew one certificate (manual/DNS certificates)"
         echo_info "  0) Exit"
         echo ""
-        printf "Enter choice [0-11]: "
+        printf "Enter choice [0-12]: "
         if ! read -r choice; then
             # EOF (Ctrl-D)
             echo ""
@@ -262,6 +277,7 @@ show_menu() {
             9)  _menu_run list_backups; _pause ;;
             10) _menu_locked force_renew_all; _pause ;;
             11) _menu_run configure_threshold_interactive; _pause ;;
+            12) _menu_locked _renew_one_interactive; _pause ;;
             0)
                 echo_info "Exiting."
                 echo ""
@@ -389,6 +405,14 @@ main() {
             --list-backups)
                 command="list_backups"
                 ;;
+            --renew-cert)
+                if [[ $# -lt 2 ]] || [[ -z "${2:-}" ]]; then
+                    echo_error "Error: --renew-cert requires a certificate name (see: ssl-manager --scan)"
+                    exit 1
+                fi
+                command="renew_cert"
+                RENEW_CERT_ARG="$2"
+                ;;
             --restore)
                 if [[ $# -lt 2 ]]; then
                     echo_error "Error: --restore requires a backup path or timestamp"
@@ -448,6 +472,15 @@ main() {
             detect_web_server
             detect_firewall
             force_renew_all
+            release_lock
+            ;;
+        renew_cert)
+            require_root
+            acquire_lock || exit 1
+            detect_os
+            detect_web_server
+            detect_firewall
+            renew_single_certificate "$RENEW_CERT_ARG"
             release_lock
             ;;
         dry_run)
